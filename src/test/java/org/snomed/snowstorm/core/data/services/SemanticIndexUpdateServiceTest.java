@@ -7,7 +7,6 @@ import io.kaicode.elasticvc.domain.Commit;
 import org.elasticsearch.index.query.MatchAllQueryBuilder;
 import org.junit.After;
 import org.junit.Assert;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.snomed.otf.owltoolkit.conversion.ConversionException;
@@ -33,8 +32,7 @@ import java.util.stream.Collectors;
 import static io.kaicode.elasticvc.api.ComponentService.LARGE_PAGE;
 import static java.lang.Long.parseLong;
 import static org.junit.Assert.assertEquals;
-import static org.snomed.snowstorm.core.data.domain.Concepts.ISA;
-import static org.snomed.snowstorm.core.data.domain.Concepts.SNOMEDCT_ROOT;
+import static org.snomed.snowstorm.core.data.domain.Concepts.*;
 
 @RunWith(SpringJUnit4ClassRunner.class)
 @ContextConfiguration(classes = TestConfig.class)
@@ -60,15 +58,10 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 	private static final PageRequest PAGE_REQUEST = PageRequest.of(0, 50);
 
-	@Before
-	public void setup() {
-		branchService.create("MAIN");
-	}
-
 	@Test
 	public void testCommitListenerOrderingConfig() {
 		List<CommitListener> commitListeners = branchService.getCommitListeners();
-		assertEquals(3, commitListeners.size());
+		assertEquals(4, commitListeners.size());
 		assertEquals(ConceptDefinitionStatusUpdateService.class, commitListeners.get(0).getClass());
 		assertEquals(SemanticIndexUpdateService.class, commitListeners.get(1).getClass());
 		assertEquals(TraceabilityLogService.class, commitListeners.get(2).getClass());
@@ -277,6 +270,38 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 	}
 
 	@Test
+	public void testUpdateAncestorWhereDescendantHasMultipleParents() throws ServiceException {
+		Concept root = new Concept(SNOMEDCT_ROOT);
+
+		Concept a = new Concept("100001001").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		Concept aa = new Concept("100001002").addRelationship(new Relationship(ISA, a.getId()));
+		Concept aaa = new Concept("100001003").addRelationship(new Relationship(ISA, aa.getId()));
+
+		Concept ab = new Concept("100002001").addRelationship(new Relationship(ISA, a.getId()));
+
+		Concept ac = new Concept("100003001").addRelationship(new Relationship(ISA, a.getId()));
+		Concept acc = new Concept("100003002").addRelationship(new Relationship(ISA, ac.getId()));
+		// This concept has 2 parents in different parts of the 'a' hierarchy
+		Concept accc = new Concept("100003003")
+				.addRelationship(new Relationship(ISA, acc.getId()))
+				.addRelationship(new Relationship(ISA, aaa.getId()));
+
+		String branch = "MAIN";
+		conceptService.batchCreate(Lists.newArrayList(root, a, aa, aaa, ab, ac, acc, accc), branch);
+
+		assertTC(accc, a, aa, aaa, ac, acc, acc, root);
+		assertTC(ac, a, root);
+
+		ac.getRelationships().clear();
+		ac.addRelationship(new Relationship(ISA, ab.getId()));
+		conceptService.update(ac, branch);
+
+		assertTC(ac, ab, a, root);
+		// After 'ac' is updated descendant 'accc' should gain ancestor 'ab' but should not loose existing ancestors from alternative routes e.g. 'aa'.
+		assertTC(accc, a, aa, aaa, ac, acc, acc, ab, root);
+	}
+
+	@Test
 	public void testSecondIsARemoval() throws ServiceException {
 		Concept root = new Concept(SNOMEDCT_ROOT);
 
@@ -404,20 +429,20 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		concepts.add(new Concept(SNOMEDCT_ROOT));
 		concepts.add(new Concept("116680003")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 		concepts.add(new Concept("39607008")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 		concepts.add(new Concept("363698007")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 
 		conceptService.batchCreate(concepts, path);
 		concepts.clear();
 
 		concepts.add(new Concept("34020007")
-				.addRelationship(new Relationship(UUID.randomUUID().toString(), ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(UUID.randomUUID().toString(), ISA, SNOMEDCT_ROOT).setInferred(true))
 				.addRelationship(new Relationship("756906025", 20040731, false, "900000000000207008", "34020007", "39607008", 1, "363698007", "900000000000011006", "900000000000451002"))
 				.addRelationship(new Relationship("3250849023", 20100131, false, "900000000000207008", "34020007", "39607008", 1, "363698007", "900000000000011006", "900000000000451002"))
 				.addRelationship(new Relationship("3332956025", 20150731, false, "900000000000207008", "34020007", "39607008", 2, "363698007", "900000000000011006", "900000000000451002"))
@@ -438,20 +463,20 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		concepts.add(new Concept(SNOMEDCT_ROOT));
 		concepts.add(new Concept("116680003")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 		concepts.add(new Concept("39607008")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 		concepts.add(new Concept("363698007")
-				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setInferred(true))
 		);
 
 		conceptService.batchCreate(concepts, path);
 		concepts.clear();
 
 		concepts.add(new Concept("34020007")
-				.addRelationship(new Relationship(UUID.randomUUID().toString(), ISA, SNOMEDCT_ROOT).setCharacteristicTypeId(Relationship.CharacteristicType.inferred.getConceptId()))
+				.addRelationship(new Relationship(UUID.randomUUID().toString(), ISA, SNOMEDCT_ROOT).setInferred(true))
 				.addRelationship(new Relationship("3332956025", 20150731, false, "900000000000207008", "34020007", "39607008", 1, "363698007", "900000000000011006", "900000000000451002"))
 				.addRelationship(new Relationship("5963641025", 20150731, true, "900000000000207008", "34020007", "39607008", 1, "363698007", "900000000000011006", "900000000000451002"))
 		);
@@ -485,6 +510,126 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 		assertEquals(4, queryService.search(queryService.createQueryBuilder(false).ecl("<" + SNOMEDCT_ROOT), path, QueryService.PAGE_OF_ONE).getTotalElements());
 		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("*:363698007=*"), path, QueryService.PAGE_OF_ONE).getTotalElements());
 		assertEquals(5, queryService.search(queryService.createQueryBuilder(false).ecl("<<" + SNOMEDCT_ROOT), path, QueryService.PAGE_OF_ONE).getTotalElements());
+	}
+
+	@Test
+	public void testSameTripleMadeInactiveInDifferentModule() throws ServiceException {
+		// There are around 150 instances in the US Edition of 'is a' relationships being made inactive in the US module straight
+		// after the same triple is made active in the International Module (different relationship id).
+		// This test checks that making the same triple inactive in a different module does not remove the triple from the semantic index.
+
+		String path = "MAIN";
+		List<Concept> concepts = new ArrayList<>();
+
+		concepts.add(new Concept(SNOMEDCT_ROOT));
+		String internationalCoreModule = "900000000000207008";
+		String usModule = "731000124108";
+
+		// Create concept with US relationship
+		Concept concept = new Concept("272379006").setModuleId(internationalCoreModule)
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT).setModuleId(usModule).setInferred(true));
+		concepts.add(concept);
+		conceptService.batchCreate(concepts, path);
+		concepts.clear();
+
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + SNOMEDCT_ROOT), path, QueryService.PAGE_OF_ONE).getTotalElements());
+
+		// Add Int relationship
+		concept.getRelationships().add(new Relationship(ISA, SNOMEDCT_ROOT).setModuleId(internationalCoreModule).setInferred(true));
+		conceptService.update(concept, path);
+
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + SNOMEDCT_ROOT), path, QueryService.PAGE_OF_ONE).getTotalElements());
+
+		// Make US relationship inactive
+		concept.getRelationships().stream().filter(relationship -> relationship.getModuleId().equals(usModule)).forEach(relationship -> relationship.setActive(false));
+		conceptService.update(concept, path);
+
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(false).ecl("<" + SNOMEDCT_ROOT), path, QueryService.PAGE_OF_ONE).getTotalElements());
+	}
+
+	@Test
+	// This tests the semantic index recognises that relationships can be made inactive on a parent branch but still be active on the child.
+	// The concepts used in this unit test are completely meaningless, as usual.
+	public void testSameTripleMadeInactiveInChildBranchAfterParentChanged() throws ServiceException {
+		String path = "MAIN";
+		String extensionBranch = "MAIN/SNOMEDCT-US";
+		List<Concept> concepts = new ArrayList<>();
+
+		concepts.add(new Concept(SNOMEDCT_ROOT));
+		concepts.add(new Concept(CLINICAL_FINDING).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)));
+		concepts.add(new Concept(FINDING_SITE).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)));
+
+		// Create concept with relationship to root and clinical finding
+		String conceptId = "272379006";
+		Concept concept = new Concept(conceptId)
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT))
+				.addRelationship(new Relationship(ISA, CLINICAL_FINDING));
+		concepts.add(concept);
+		conceptService.batchCreate(concepts, path);
+		concepts.clear();
+
+		// Create child branch
+		branchService.create(extensionBranch);
+		assertEquals("Concept exists on child branch",
+				1, queryService.search(queryService.createQueryBuilder(true).ecl("<" + CLINICAL_FINDING), extensionBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+
+		// On the parent branch inactivate the concept parents and add another
+		concept.getRelationships().forEach(relationship -> relationship.setActive(false));
+		concept.getRelationships().add(new Relationship(ISA, FINDING_SITE));
+		conceptService.update(concept, path);
+
+		// Child branch is still on the original version of the concept.
+		// Make the relationship to root inactive - should still have the parent to clinical finding after that
+		Concept extensionVersionConcept = conceptService.find(conceptId, extensionBranch);
+		extensionVersionConcept.getRelationships().stream()
+				.filter(relationship -> relationship.getDestinationId().equals(SNOMEDCT_ROOT)).forEach(relationship -> relationship.setActive(false));
+		conceptService.update(extensionVersionConcept, extensionBranch);
+
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(true).ecl("<" + CLINICAL_FINDING), extensionBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+	}
+
+	@Test
+	// This tests the semantic index recognises that relationships can be made inactive on a grandparent branch but still be active on the child.
+	// The concepts used in this unit test are completely meaningless, as usual.
+	public void testSameTripleMadeInactiveInChildBranchAfterGrandparentChanged() throws ServiceException {
+		String path = "MAIN";
+		String extensionBranch = "MAIN/SNOMEDCT-US";
+		String extensionProjectBranch = "MAIN/SNOMEDCT-US/PROJECTA";
+		List<Concept> concepts = new ArrayList<>();
+
+		concepts.add(new Concept(SNOMEDCT_ROOT));
+		concepts.add(new Concept(CLINICAL_FINDING).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)));
+		concepts.add(new Concept(FINDING_SITE).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)));
+
+		// Create concept with relationship to root and clinical finding
+		String conceptId = "272379006";
+		Concept concept = new Concept(conceptId)
+				.addRelationship(new Relationship(ISA, SNOMEDCT_ROOT))
+				.addRelationship(new Relationship(ISA, CLINICAL_FINDING));
+		concepts.add(concept);
+		conceptService.batchCreate(concepts, path);
+		concepts.clear();
+
+		// Create child branch
+		branchService.create(extensionBranch);
+
+		// On the parent branch inactivate the concept
+		concept.setActive(false);
+		conceptService.update(concept, path);
+
+		// Create grandchild branch
+		branchService.create(extensionProjectBranch);
+		assertEquals("Concept exists on grandchild branch",
+				1, queryService.search(queryService.createQueryBuilder(true).ecl("<" + CLINICAL_FINDING), extensionProjectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
+
+		// Grandchild branch is still on the original version of the concept.
+		// Make the relationship to root inactive - should still have the parent to clinical finding after that
+		Concept extensionVersionConcept = conceptService.find(conceptId, extensionProjectBranch);
+		extensionVersionConcept.getRelationships().stream()
+				.filter(relationship -> relationship.getDestinationId().equals(SNOMEDCT_ROOT)).forEach(relationship -> relationship.setActive(false));
+		conceptService.update(extensionVersionConcept, extensionProjectBranch);
+
+		assertEquals(1, queryService.search(queryService.createQueryBuilder(true).ecl("<" + CLINICAL_FINDING), extensionProjectBranch, QueryService.PAGE_OF_ONE).getTotalElements());
 	}
 
 	private void simulateRF2Import(String path, List<Concept> concepts) {

@@ -63,7 +63,6 @@ public class ConceptServiceTest extends AbstractTest {
 
 	@Before
 	public void setup() {
-		branchService.create("MAIN");
 		testUtil = new ServiceTestUtil(conceptService);
 		objectMapper = new ObjectMapper();
 		DeserializationConfig deserializationConfig = objectMapper.getDeserializationConfig().without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
@@ -221,9 +220,9 @@ public class ConceptServiceTest extends AbstractTest {
 		Relationship createdRelationship = concept.getRelationships().iterator().next();
 		assertNotNull(createdRelationship);
 		assertNotNull(createdRelationship.type());
-		assertEquals("Creation response should contain FSN within relationship type", "Is a (attribute)", createdRelationship.type().getFsn());
+		assertEquals("Creation response should contain FSN within relationship type", "Is a (attribute)", createdRelationship.type().getFsnTerm());
 		assertEquals("Creation response should contain definition status within relationship type", "PRIMITIVE", createdRelationship.type().getDefinitionStatus());
-		assertEquals("Creation response should contain FSN within relationship target", "SNOMED CT Concept", createdRelationship.target().getFsn());
+		assertEquals("Creation response should contain FSN within relationship target", "SNOMED CT Concept", createdRelationship.target().getFsnTerm());
 		assertEquals("Creation response should contain definition status within relationship target", "PRIMITIVE", createdRelationship.target().getDefinitionStatus());
 
 		assertEquals(3, concept.getRelationships().size());
@@ -231,9 +230,9 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals(3, foundConcept.getRelationships().size());
 
 		Relationship foundRelationship = foundConcept.getRelationships().iterator().next();
-		assertEquals("Find response should contain FSN within relationship type", "Is a (attribute)", foundRelationship.type().getFsn());
+		assertEquals("Find response should contain FSN within relationship type", "Is a (attribute)", foundRelationship.type().getFsnTerm());
 		assertEquals("Find response should contain definition status within relationship type", "PRIMITIVE", foundRelationship.type().getDefinitionStatus());
-		assertEquals("Find response should contain FSN within relationship target", "SNOMED CT Concept", foundRelationship.target().getFsn());
+		assertEquals("Find response should contain FSN within relationship target", "SNOMED CT Concept", foundRelationship.target().getFsnTerm());
 		assertEquals("Find response should contain definition status within relationship target", "PRIMITIVE", foundRelationship.target().getDefinitionStatus());
 
 		concept.getRelationships().remove(new Relationship("100003"));
@@ -243,9 +242,9 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals(2, conceptService.find("100001", "MAIN").getRelationships().size());
 
 		Relationship updatedRelationship = foundConcept.getRelationships().iterator().next();
-		assertEquals("Update response should contain FSN within relationship type", "Is a (attribute)", updatedRelationship.type().getFsn());
+		assertEquals("Update response should contain FSN within relationship type", "Is a (attribute)", updatedRelationship.type().getFsnTerm());
 		assertEquals("Update response should contain definition status within relationship type", "PRIMITIVE", updatedRelationship.type().getDefinitionStatus());
-		assertEquals("Update response should contain FSN within relationship target", "SNOMED CT Concept", updatedRelationship.target().getFsn());
+		assertEquals("Update response should contain FSN within relationship target", "SNOMED CT Concept", updatedRelationship.target().getFsnTerm());
 		assertEquals("Update response should contain definition status within relationship target", "PRIMITIVE", updatedRelationship.target().getDefinitionStatus());
 	}
 
@@ -440,6 +439,38 @@ public class ConceptServiceTest extends AbstractTest {
 	}
 
 	@Test
+	public void testGciWithOneRelationshipError() throws ServiceException {
+		try {
+			conceptService.create(new Concept()
+							.addAxiom(new Relationship(ISA, CLINICAL_FINDING))
+							.addGeneralConceptInclusionAxiom(new Relationship(ISA, "131148009"))
+					, "MAIN");
+			fail("IllegalArgumentException should have been thrown.");
+		} catch (ServiceException e) {
+			fail("IllegalArgumentException should have been thrown.");
+		} catch (IllegalArgumentException e) {
+			assertEquals("The relationships of a GCI axiom must include at least one parent and one attribute.", e.getMessage());
+		}
+
+		try {
+			conceptService.create(new Concept()
+							.addAxiom(new Relationship(ISA, CLINICAL_FINDING))
+							.addGeneralConceptInclusionAxiom(new Relationship(ISA, "131148009"), new Relationship(ISA, CLINICAL_FINDING))
+					, "MAIN");
+			fail("IllegalArgumentException should have been thrown.");
+		} catch (ServiceException e) {
+			fail("IllegalArgumentException should have been thrown.");
+		} catch (IllegalArgumentException e) {
+			assertEquals("The relationships of a GCI axiom must include at least one parent and one attribute.", e.getMessage());
+		}
+
+		conceptService.create(new Concept()
+						.addAxiom(new Relationship(ISA, CLINICAL_FINDING))
+						.addGeneralConceptInclusionAxiom(new Relationship(ISA, "131148009"), new Relationship(FINDING_SITE, HEART_STRUCTURE))
+				, "MAIN");
+	}
+
+	@Test
 	public void testConceptInactivation() throws ServiceException {
 		String path = "MAIN";
 		conceptService.batchCreate(Lists.newArrayList(new Concept("107658001"), new Concept("116680003")), path);
@@ -493,8 +524,27 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals(concept.getId(), associationTargetMember.getReferencedComponentId());
 		assertEquals("87100004", associationTargetMember.getAdditionalField("targetComponentId"));
 
-		assertFalse(inactiveConcept.getRelationships().iterator().next().isActive());
-		assertTrue(inactiveConcept.getDescriptions().iterator().next().isActive());
+		Description description = inactiveConcept.getDescriptions().iterator().next();
+		assertTrue("Description is still active", description.isActive());
+		assertEquals("Description automatically has inactivation indicator", "CONCEPT_NON_CURRENT", description.getInactivationIndicator());
+
+		assertFalse("Relationship is inactive.", inactiveConcept.getRelationships().iterator().next().isActive());
+	}
+
+	@Test
+	public void testCreateObjectAttribute() throws ServiceException {
+		conceptService.create(new Concept(CONCEPT_MODEL_OBJECT_ATTRIBUTE)
+						.addFSN("Concept model object attribute (attribute)")
+						.addAxiom(new Axiom().setRelationships(Collections.singleton(new Relationship(ISA, CONCEPT_MODEL_ATTRIBUTE))))
+				, "MAIN");
+
+		Concept newAttributeConcept = new Concept("813815325507419009")
+				.addAxiom(new Axiom().setRelationships(Collections.singleton(new Relationship(ISA, CONCEPT_MODEL_OBJECT_ATTRIBUTE))))
+				.addFSN("New attribute (attribute)");
+		newAttributeConcept = conceptService.create(newAttributeConcept, "MAIN");
+		Axiom axiom = newAttributeConcept.getClassAxioms().iterator().next();
+		assertEquals("SubObjectPropertyOf(:813815325507419009 :762705008)", axiom.getReferenceSetMember().getAdditionalField(ReferenceSetMember.OwlExpressionFields.OWL_EXPRESSION));
+		assertEquals(PRIMITIVE, axiom.getDefinitionStatusId());
 	}
 
 	@Test
@@ -643,8 +693,47 @@ public class ConceptServiceTest extends AbstractTest {
 	}
 
 	@Test
+	public void testInactivateDescriptionAcceptabilityViaDescriptionInactivation() throws ServiceException {
+		final Concept concept = new Concept("50960005", 20020131, true, "900000000000207008", "900000000000074008");
+		// Add acceptability with released refset member
+		concept.addDescription(
+				new Description("84923010", 20020131, true, "900000000000207008", "50960005", "en", "900000000000013009", "Bleeding", "900000000000020002")
+						.addLanguageRefsetMember("900000000000509007", Concepts.PREFERRED)
+		);
+		conceptService.create(concept, "MAIN");
+		releaseService.createVersion(20170731, "MAIN");
+
+		// Check acceptability
+		final Concept savedConcept1 = conceptService.find("50960005", "MAIN");
+		final Description description1 = savedConcept1.getDescriptions().iterator().next();
+		final Map<String, ReferenceSetMember> members1 = description1.getLangRefsetMembers();
+		assertEquals(Concepts.PREFERRED, members1.get("900000000000509007").getAdditionalField("acceptabilityId"));
+		assertTrue(members1.get("900000000000509007").isReleased());
+		assertTrue(members1.get("900000000000509007").isActive());
+		assertNotNull(members1.get("900000000000509007").getEffectiveTime());
+
+		assertEquals(1, description1.getAcceptabilityMap().size());
+
+		// Make description inactive and save
+		description1.setActive(false);
+		conceptService.update(savedConcept1, "MAIN");
+
+		// Check acceptability is inactive
+		logger.info("Loading updated concept");
+		final Concept savedConcept2 = conceptService.find("50960005", "MAIN");
+		final Description description2 = savedConcept2.getDescriptions().iterator().next();
+		final Map<String, ReferenceSetMember> members2 = description2.getLangRefsetMembers();
+		assertEquals(1, members2.size());
+		assertFalse(members2.get("900000000000509007").isActive());
+		assertNull(members2.get("900000000000509007").getEffectiveTime());
+
+		// Check that acceptability map is empty
+		assertEquals(0, description2.getAcceptabilityMap().size());
+	}
+
+	@Test
 	public void testLatestVersionMatch() throws ServiceException {
-		testUtil.createConceptWithPathIdAndTerms("MAIN", "100001", "Heart");
+		testUtil.createConceptWithPathIdAndTerm("MAIN", "100001", "Heart");
 
 		assertEquals(1, descriptionService.findDescriptionsWithAggregations("MAIN", "Heart", ServiceTestUtil.PAGE_REQUEST).getNumberOfElements());
 		assertEquals(0, descriptionService.findDescriptionsWithAggregations("MAIN", "Bone", ServiceTestUtil.PAGE_REQUEST).getNumberOfElements());
@@ -679,7 +768,7 @@ public class ConceptServiceTest extends AbstractTest {
 
 		// Create concept
 		final Concept concept = new Concept(conceptId, null, true, originalModuleId, "900000000000074008")
-				.addDescription(new Description("10000123", null, true, originalModuleId, conceptId, "en",
+				.addDescription(new Description("10000013", null, true, originalModuleId, conceptId, "en",
 						Concepts.FSN, "Pizza", Concepts.CASE_INSENSITIVE).addLanguageRefsetMember(Concepts.GB_EN_LANG_REFSET, Concepts.PREFERRED));
 		conceptService.create(concept, path);
 
@@ -747,14 +836,13 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals(effectiveTime, memberWithRestoredDate.getEffectiveTimeI());
 	}
 
-	// Uncomment to run - takes around 45 seconds.
-//	@Test
+	@Test
 	public void testCreateUpdate10KConcepts() throws ServiceException {
 		branchService.create("MAIN/A");
 		conceptService.create(new Concept(SNOMEDCT_ROOT), "MAIN/A");
 
 		List<Concept> concepts = new ArrayList<>();
-		final int tenThousand = 10 * 1000;
+		final int tenThousand = 10_000;
 		for (int i = 0; i < tenThousand; i++) {
 			concepts.add(
 					new Concept(null, Concepts.CORE_MODULE)
@@ -793,14 +881,6 @@ public class ConceptServiceTest extends AbstractTest {
 		}
 		assertEquals(anotherModule, someConcept.getModuleId());
 		assertEquals(1, someConcept.getRelationships().size());
-
-		// Move all concepts in hierarchy
-		conceptService.create(new Concept(Concepts.CLINICAL_FINDING).addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)), "MAIN/A");
-		concepts.forEach(c -> {
-			c.getRelationships().iterator().next().setActive(false);
-			c.addRelationship(new Relationship(ISA, Concepts.CLINICAL_FINDING));
-		});
-		conceptService.createUpdate(concepts, "MAIN/A");
 	}
 
 	private void printAllDescriptions(String path) {

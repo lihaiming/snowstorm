@@ -10,9 +10,9 @@ import io.swagger.annotations.ApiParam;
 import org.snomed.snowstorm.core.data.domain.BranchMergeJob;
 import org.snomed.snowstorm.core.data.domain.Concept;
 import org.snomed.snowstorm.core.data.domain.review.BranchReview;
-import org.snomed.snowstorm.core.data.domain.review.BranchReviewConceptChanges;
 import org.snomed.snowstorm.core.data.domain.review.MergeReview;
 import org.snomed.snowstorm.core.data.domain.review.MergeReviewConceptVersions;
+import org.snomed.snowstorm.core.data.domain.review.ReviewStatus;
 import org.snomed.snowstorm.core.data.services.*;
 import org.snomed.snowstorm.core.data.services.pojo.IntegrityIssueReport;
 import org.snomed.snowstorm.rest.pojo.*;
@@ -56,6 +56,20 @@ public class BranchController {
 			branch.setMetadata(null);
 		}
 		return allBranches;
+	}
+	
+	@ApiOperation("Retrieve branch descendants")
+	@RequestMapping(value = "/branches/{path}/children", method = RequestMethod.GET)
+	@ResponseBody
+	public List<Branch> retrieveBranchDescendants(
+			@PathVariable String path,
+			@RequestParam(required = false, defaultValue = "false") boolean immediateChildren) {
+		List<Branch> descendants = branchService.findChildren(BranchPathUriUtil.decodePath(path), immediateChildren);
+		// Clear metadata
+		for (Branch branch : descendants) {
+			branch.setMetadata(null);
+		}
+		return descendants;
 	}
 
 	@RequestMapping(value = "/branches", method = RequestMethod.POST)
@@ -107,7 +121,11 @@ public class BranchController {
 	@ResponseBody
 	@RequestMapping(value = "/reviews/{id}/concept-changes", method = RequestMethod.GET)
 	public BranchReviewConceptChanges getBranchReviewConceptChanges(@PathVariable String id) {
-		return reviewService.getBranchReviewConceptChanges(id);
+		BranchReview branchReview = reviewService.getBranchReviewOrThrow(id);
+		if (branchReview.getStatus() != ReviewStatus.CURRENT) {
+			throw new IllegalStateException("Branch review status must be " + ReviewStatus.CURRENT + " but is " + branchReview.getStatus());
+		}
+		return new BranchReviewConceptChanges(branchReview.getChangedConcepts());
 	}
 
 	@ResponseBody
@@ -133,18 +151,13 @@ public class BranchController {
 	}
 
 	@RequestMapping(value = "/merge-reviews/{id}/{conceptId}", method = RequestMethod.POST)
-	public void saveMergeReviewConflictingConcept(@PathVariable String id, @PathVariable String conceptId, @RequestBody Concept manuallyMergedConcept) {
-		final MergeReview mergeReview = reviewService.getMergeReviewOrThrow(id);
-		if (!conceptId.equals(manuallyMergedConcept.getConceptId())) {
-			throw new IllegalArgumentException("conceptId in request path does not match the conceptId in the request body.");
-		}
-		mergeReview.putManuallyMergedConcept(manuallyMergedConcept);
+	public void saveMergeReviewConflictingConcept(@PathVariable String id, @PathVariable Long conceptId, @RequestBody Concept manuallyMergedConcept) throws ServiceException {
+		reviewService.persistManuallyMergedConcept(id, conceptId, manuallyMergedConcept);
 	}
 
 	@RequestMapping(value = "/merge-reviews/{id}/{conceptId}", method = RequestMethod.DELETE)
 	public void deleteMergeReviewConflictingConcept(@PathVariable String id, @PathVariable Long conceptId) {
-		final MergeReview mergeReview = reviewService.getMergeReviewOrThrow(id);
-		mergeReview.putManuallyMergedConceptDeletion(conceptId);
+		reviewService.persistManualMergeConceptDeletion(id, conceptId);
 	}
 
 	@RequestMapping(value = "/merge-reviews/{id}/apply", method = RequestMethod.POST)

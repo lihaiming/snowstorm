@@ -1,10 +1,14 @@
 package org.snomed.snowstorm.rest;
 
 import com.fasterxml.jackson.annotation.JsonView;
+import io.kaicode.elasticvc.api.BranchCriteria;
+import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.rest.util.branchpathrewrite.BranchPathUriUtil;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.ApiParam;
+import org.apache.commons.lang3.SerializationUtils;
+import org.elasticsearch.common.util.set.Sets;
 import org.snomed.snowstorm.core.data.domain.ConceptMini;
 import org.snomed.snowstorm.core.data.domain.ReferenceSetMember;
 import org.snomed.snowstorm.core.data.domain.ReferenceSetMemberView;
@@ -13,6 +17,9 @@ import org.snomed.snowstorm.core.data.services.ReferenceSetMemberService;
 import org.snomed.snowstorm.core.data.services.identifier.IdentifierService;
 import org.snomed.snowstorm.core.data.services.pojo.MemberSearchRequest;
 import org.snomed.snowstorm.core.data.services.pojo.PageWithBucketAggregations;
+import org.snomed.snowstorm.core.data.services.pojo.RefSetMemberPageWithBucketAggregations;
+import org.snomed.snowstorm.core.util.TimerUtil;
+import org.snomed.snowstorm.ecl.ECLQueryService;
 import org.snomed.snowstorm.rest.pojo.ItemsPage;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
@@ -35,31 +42,69 @@ public class ReferenceSetMemberController {
 	@Autowired
 	private ConceptService conceptService;
 
+	@Autowired
+	private ECLQueryService eclQueryService;
+
+	@Autowired
+	private VersionControlHelper versionControlHelper;
+
 	@ApiOperation("Search for reference set ids")
 	@RequestMapping(value = "/browser/{branch}/members", method = RequestMethod.GET)
 	@ResponseBody
-	@JsonView(value = View.Component.class)
-	public PageWithBucketAggregations<ReferenceSetMember> findBrowserReferenceSetMembersWithAggregations(
+	public RefSetMemberPageWithBucketAggregations<ReferenceSetMember> findBrowserReferenceSetMembersWithAggregations(
 			@PathVariable String branch,
-			@RequestParam(required = false) Boolean activeMember,
+			@ApiParam("A reference set identifier or ECL expression can be used to limit the reference sets searched. Example: <723564002")
+			@RequestParam(required = false) String referenceSet,
+			@RequestParam(required = false) String referencedComponentId,
+			@RequestParam(required = false) Boolean active,
 			@RequestParam(defaultValue = "0") int offset,
 			@RequestParam(defaultValue = "10") int limit,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
 
-		String path = BranchPathUriUtil.decodePath(branch);
-		PageRequest pageRequest = ControllerHelper.getPageRequest(offset, limit);
-		PageWithBucketAggregations<ReferenceSetMember> page = memberService.findReferenceSetMembersWithAggregations(path, pageRequest, activeMember);
-
-		 Map<String, Map<String, Long>> buckets = page.getBuckets();
+		branch = BranchPathUriUtil.decodePath(branch);
 		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
-		 Set<String> conceptIds = new HashSet<>();
-		 for (String key : buckets.keySet()) {
-		 	conceptIds.addAll(buckets.get(key).keySet());
-		 }
-		Map<String, ConceptMini> conceptMinis = conceptService.findConceptMinis(path, conceptIds, languageCodes).getResultsMap();
+		PageRequest pageRequest = ControllerHelper.getPageRequest(offset, limit);
 
-		PageWithBucketAggregations<ReferenceSetMember> pageWithBucketAggregations = new PageWithBucketAggregations<>(page.getContent(), page.getPageable(), page.getTotalElements(), page.getBuckets());
-		pageWithBucketAggregations.setBucketConcepts(conceptMinis);
+		TimerUtil timer = new TimerUtil("Member aggregation debug " + branch);
+		// Find Reference Sets with aggregation
+		MemberSearchRequest searchRequest = new MemberSearchRequest()
+				.active(active)
+				.referenceSet(referenceSet)
+				.referencedComponentId(referencedComponentId);
+		PageWithBucketAggregations<ReferenceSetMember> page = memberService.findReferenceSetMembersWithAggregations(branch, pageRequest, searchRequest);
+		timer.checkpoint("aggregation");
+
+		Set<String> referenceSetIds = page.getBuckets().get("memberCountsByReferenceSet").keySet();
+
+		// Find refset type
+		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
+		Map<String, String> refsetTypes = memberService.findRefsetTypes(referenceSetIds, branchCriteria, branch);
+		timer.checkpoint("load types (" + referenceSetIds.size() + ")");
+
+		// Load concept minis
+		Map<String, ConceptMini> conceptMinis = conceptService.findConceptMinis(branch, Sets.union(referenceSetIds, new HashSet<>(refsetTypes.values())), languageCodes).getResultsMap();
+		Map<String, ConceptMini> referenceSets = new HashMap<>();
+		for (String referenceSetId : referenceSetIds) {
+			ConceptMini refsetMini = conceptMinis.get(referenceSetId);
+			if (refsetMini != null) {
+				String type = refsetTypes.get(referenceSetId);
+				if (type != null) {
+					// If refset equals type then clone before adding field to prevent infinite recursion!
+					ConceptMini typeConcept = conceptMinis.get(type);
+					if (refsetMini == typeConcept) {
+						typeConcept = SerializationUtils.clone(typeConcept);
+					}
+					refsetMini.addExtraField("referenceSetType", typeConcept);
+				}
+				referenceSets.put(referenceSetId, refsetMini);
+			}
+		}
+		timer.checkpoint("Load minis");
+
+		RefSetMemberPageWithBucketAggregations<ReferenceSetMember> pageWithBucketAggregations =
+				new RefSetMemberPageWithBucketAggregations<>(page.getContent(), page.getPageable(), page.getTotalElements(), page.getBuckets().get("memberCountsByReferenceSet"));
+		pageWithBucketAggregations.setReferenceSets(referenceSets);
+		timer.finish();
 		return pageWithBucketAggregations;
 	}
 

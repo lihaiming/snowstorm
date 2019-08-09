@@ -7,6 +7,7 @@ import io.kaicode.elasticvc.api.CommitListener;
 import io.kaicode.elasticvc.api.PathUtil;
 import io.kaicode.elasticvc.domain.Commit;
 import it.unimi.dsi.fastutil.longs.Long2ObjectArrayMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import org.ihtsdo.sso.integration.SecurityUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,9 +83,8 @@ public class TraceabilityLogService implements CommitListener {
 		Iterable<ReferenceSetMember> persistedReferenceSetMembers = batchSavePersistedComponents.getPersistedReferenceSetMembers();
 
 		Set<Concept> concepts = StreamSupport.stream(persistedConcepts.spliterator(), false).collect(Collectors.toSet());
-		String commitComment = createCommitComment(userId, commit, concepts);
 
-		Activity activity = new Activity(userId, commitComment, commit.getBranch().getPath(), commit.getTimepoint().getTime());
+		Activity activity = new Activity(userId, commit.getBranch().getPath(), commit.getTimepoint().getTime());
 		Map<Long, Activity.ConceptActivity> activityMap = new Long2ObjectArrayMap<>();
 		Map<Long, Long> componentToConceptIdMap = new Long2ObjectArrayMap<>();
 		for (Concept concept : concepts) {
@@ -138,6 +138,37 @@ public class TraceabilityLogService implements CommitListener {
 			}
 		}
 
+		Map<String, Activity.ConceptActivity> changes = activity.getChanges();
+		boolean changeFound = false;
+		for (Activity.ConceptActivity conceptActivity : changes.values()) {
+			if (!conceptActivity.getChanges().isEmpty()) {
+				changeFound = true;
+				break;
+			}
+		}
+		if (commit.getCommitType() == CONTENT && !changeFound) {
+			logger.info("Skipping traceability because there was no traceable change.");
+			return;
+		}
+
+		boolean anyStatedChanges = false;
+		if (!activityMap.isEmpty()) {
+			List<Long> conceptsWithNoChange = new LongArrayList();
+			for (Activity.ConceptActivity conceptActivity : activityMap.values()) {
+				if (conceptActivity.getChanges().isEmpty()) {
+					conceptsWithNoChange.add(conceptActivity.getConcept().getConceptIdAsLong());
+				} else if (conceptActivity.isStatedChange()) {
+					anyStatedChanges = true;
+				}
+			}
+			for (Long conceptId : conceptsWithNoChange) {
+				changes.remove(conceptId.toString());
+			}
+		}
+
+		String commitComment = createCommitComment(userId, commit, concepts, anyStatedChanges);
+		activity.setCommitComment(commitComment);
+
 		if (activityMap.size() > inferredMax) {
 			// Limit the number of inferred changes recorded
 			List<String> conceptChangesToRemove = new ArrayList<>();
@@ -151,7 +182,6 @@ public class TraceabilityLogService implements CommitListener {
 					}
 				}
 			}
-			Map<String, Activity.ConceptActivity> changes = activity.getChanges();
 			for (String conceptId : conceptChangesToRemove) {
 				changes.remove(conceptId);
 			}
@@ -166,14 +196,14 @@ public class TraceabilityLogService implements CommitListener {
 		activityConsumer.accept(activity);
 	}
 
-	String createCommitComment(String userId, Commit commit, Collection<Concept> concepts) {
+	String createCommitComment(String userId, Commit commit, Collection<Concept> concepts, boolean anyStatedChanges) {
 		Commit.CommitType commitType = commit.getCommitType();
 		if (commitType == CONTENT) {
-			if (concepts.size() == 1) {
+			if (!anyStatedChanges) {
+				return "Classified ontology.";
+			} else if (concepts.size() == 1) {
 				Concept concept = concepts.iterator().next();
-				return (concept.isCreating() ? "Creating " : "Updating ") + "concept " + concept.getFsn();
-			} else if (concepts.isEmpty()) {
-				return "No concept changes.";
+				return (concept.isCreating() ? "Creating " : "Updating ") + "concept " + concept.getFsn().getTerm();
 			} else {
 				return "Bulk update to " + concepts.size() + " concepts.";
 			}
@@ -188,7 +218,7 @@ public class TraceabilityLogService implements CommitListener {
 		this.activityConsumer = activityConsumer;
 	}
 
-	void setEnabled(boolean enabled) {
+	public void setEnabled(boolean enabled) {
 		this.enabled = enabled;
 	}
 

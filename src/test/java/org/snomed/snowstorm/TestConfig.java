@@ -4,6 +4,7 @@ import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.snomed.snowstorm.config.Config;
+import org.snomed.snowstorm.core.data.services.TraceabilityLogService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.data.elasticsearch.ElasticsearchAutoConfiguration;
@@ -17,6 +18,7 @@ import org.springframework.data.elasticsearch.rest.ElasticsearchRestClient;
 import pl.allegro.tech.embeddedelasticsearch.EmbeddedElastic;
 import pl.allegro.tech.embeddedelasticsearch.PopularProperties;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.File;
 import java.io.IOException;
@@ -39,14 +41,23 @@ import java.util.concurrent.TimeUnit;
 public class TestConfig extends Config {
 
 	private static final String ELASTIC_SEARCH_VERSION = "6.5.4";
-	public static final List<String> DEFAULT_LANGUAGE_CODES = Collections.singletonList("en");
+	public static final String DEFAULT_LANGUAGE_CODE = "en";
+	public static final List<String> DEFAULT_LANGUAGE_CODES = Collections.singletonList(DEFAULT_LANGUAGE_CODE);
 
 	@Autowired
 	private ElasticsearchOperations elasticsearchTemplate;
 
+	@Autowired
+	private TraceabilityLogService traceabilityLogService;
+
 	private static EmbeddedElastic testElasticsearchSingleton;
 	private static File installationDirectory;
 	private static final int PORT = 9931;
+
+	@PostConstruct
+	public void init() {
+		traceabilityLogService.setEnabled(false);
+	}
 
 	@Bean
 	public ElasticsearchRestClient elasticsearchClient() {
@@ -67,6 +78,7 @@ public class TestConfig extends Config {
 						.withStartTimeout(2, TimeUnit.MINUTES)
 						.withSetting(PopularProperties.CLUSTER_NAME, clusterName)
 						.withSetting(PopularProperties.HTTP_PORT, PORT)
+						.withSetting("cluster.routing.allocation.disk.threshold_enabled", false)
 						// Manually delete installation directory to prevent verbose error logging
 						.withCleanInstallationDirectoryOnStop(false)
 						.withDownloadDirectory(downloadDir)

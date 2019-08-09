@@ -1,20 +1,20 @@
 package org.snomed.snowstorm.core.data.services;
 
-import com.google.common.cache.Cache;
-import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.Iterables;
+import io.kaicode.elasticvc.api.BranchCriteria;
 import io.kaicode.elasticvc.api.BranchService;
 import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.elasticvc.domain.Branch;
 import io.kaicode.elasticvc.domain.Commit;
 import io.kaicode.elasticvc.domain.DomainEntity;
 import io.kaicode.elasticvc.domain.Entity;
-import org.elasticsearch.common.collect.MapBuilder;
+import org.elasticsearch.index.query.QueryBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.snomed.snowstorm.core.data.domain.*;
 import org.snomed.snowstorm.core.data.domain.review.BranchReview;
 import org.snomed.snowstorm.core.data.domain.review.ReviewStatus;
+import org.snomed.snowstorm.core.data.repositories.BranchMergeJobRepository;
 import org.snomed.snowstorm.core.data.services.pojo.IntegrityIssueReport;
 import org.snomed.snowstorm.rest.pojo.MergeRequest;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,9 +27,9 @@ import org.springframework.stereotype.Service;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static io.kaicode.elasticvc.api.VersionControlHelper.LARGE_PAGE;
 import static org.elasticsearch.index.query.QueryBuilders.*;
 import static org.snomed.snowstorm.core.util.PredicateUtil.not;
 
@@ -58,12 +58,10 @@ public class BranchMergeService {
 	private DomainEntityConfiguration domainEntityConfiguration;
 
 	@Autowired
-	private IntegrityService integrityService;
+	private BranchMergeJobRepository branchMergeJobRepository;
 
-	// TODO: Move to persistent storage to prepare for autoscaling
-	private final Cache<String, BranchMergeJob> branchMergeJobStore = CacheBuilder.newBuilder()
-			.expireAfterWrite(12, TimeUnit.HOURS)
-			.build();
+	@Autowired
+	private IntegrityService integrityService;
 
 	private final ExecutorService executorService = Executors.newCachedThreadPool();
 	private static final String USE_BRANCH_REVIEW = "The target branch is diverged, please use the branch review endpoint instead.";
@@ -84,34 +82,34 @@ public class BranchMergeService {
 //		}
 
 		BranchMergeJob mergeJob = new BranchMergeJob(source, target, JobStatus.SCHEDULED);
+		branchMergeJobRepository.save(mergeJob);
+		mergeJob.setStartDate(new Date());
+		mergeJob.setStatus(JobStatus.IN_PROGRESS);
+		branchMergeJobRepository.save(mergeJob);
 		executorService.submit(() -> {
-			mergeJob.setStartDate(new Date());
-			mergeJob.setStatus(JobStatus.IN_PROGRESS);
 			try {
 				mergeBranchSync(source, target, null);
 				mergeJob.setStatus(JobStatus.COMPLETED);
 				mergeJob.setEndDate(new Date());
+				branchMergeJobRepository.save(mergeJob);
 			} catch (IntegrityException e) {
 				mergeJob.setStatus(JobStatus.CONFLICTS);
 				mergeJob.setMessage(e.getMessage());
 				mergeJob.setApiError(ApiErrorFactory.createErrorForMergeConflicts(e.getMessage(), e.getIntegrityIssueReport()));
+				branchMergeJobRepository.save(mergeJob);
 			} catch (Exception e) {
 				mergeJob.setStatus(JobStatus.FAILED);
 				mergeJob.setMessage(e.getMessage());
+				branchMergeJobRepository.save(mergeJob);
 				logger.error("Failed to merge branch",e);
 			}
 		});
-		branchMergeJobStore.put(mergeJob.getId(), mergeJob);
 
 		return mergeJob;
 	}
 
 	public BranchMergeJob getBranchMergeJobOrThrow(String id) {
-		BranchMergeJob mergeJob = branchMergeJobStore.getIfPresent(id);
-		if (mergeJob == null) {
-			throw new NotFoundException("Branch merge job not found.");
-		}
-		return mergeJob;
+		return branchMergeJobRepository.findById(id).orElseThrow(() -> new NotFoundException("Branch merge job not found."));
 	}
 
 	public void mergeBranchSync(String source, String target, Collection<Concept> manuallyMergedConcepts) throws ServiceException {
@@ -183,9 +181,28 @@ public class BranchMergeService {
 						conceptService.deleteConceptsAndComponentsWithinCommit(conceptsToDeleteWhichExistOnBranch, commit, false);
 					}
 
+					// Save merged version of manually merged concepts
+					// This has the effect of ending both visible versions of these components which prevents us seeing duplicates on the branch
 					conceptService.updateWithinCommit(manuallyMergedConcepts.stream()
 							.filter(not(Concept::isDeleted)).collect(Collectors.toSet()), commit);
 				}
+
+				// Find and resolve duplicate component versions.
+				// All components which would not trigger a merge-review should be included here.
+				// - inferred relationships
+				// - synonym descriptions
+				// - non-concept refset members
+				// (Semantic index entries on this branch will be cleared and rebuilt so no need to include those).
+				BranchCriteria changesOnBranchIncludingOpenCommit = versionControlHelper.getChangesOnBranchIncludingOpenCommit(commit);
+				BranchCriteria branchCriteriaIncludingOpenCommit = versionControlHelper.getBranchCriteriaIncludingOpenCommit(commit);
+				// Merge inferred relationships
+				removeRebaseDuplicateVersions(Relationship.class, boolQuery().must(termQuery(Relationship.Fields.CHARACTERISTIC_TYPE_ID, Concepts.INFERRED_RELATIONSHIP)),
+						changesOnBranchIncludingOpenCommit, branchCriteriaIncludingOpenCommit, commit);
+				// Merge descriptions (all types to be safe)
+				removeRebaseDuplicateVersions(Description.class, boolQuery(), changesOnBranchIncludingOpenCommit, branchCriteriaIncludingOpenCommit, commit);
+				// Merge non-concept reference set members
+				removeRebaseDuplicateVersions(ReferenceSetMember.class, boolQuery().mustNot(existsQuery(ReferenceSetMember.Fields.CONCEPT_ID)), changesOnBranchIncludingOpenCommit, branchCriteriaIncludingOpenCommit, commit);
+
 				commit.markSuccessful();
 			}
 		} else {
@@ -209,6 +226,58 @@ public class BranchMergeService {
 				componentTypeRepoMap.entrySet().parallelStream().forEach(entry -> promoteEntities(source, commit, entry.getKey(), entry.getValue(), versionsReplaced));
 				commit.markSuccessful();
 			}
+		}
+	}
+
+	private <T extends SnomedComponent> void removeRebaseDuplicateVersions(Class<T> componentClass, QueryBuilder clause,
+			BranchCriteria changesOnBranchCriteria, BranchCriteria branchCriteriaIncludingOpenCommit, Commit commit) throws ServiceException {
+
+		String idField;
+		try {
+			idField = componentClass.newInstance().getIdField();
+		} catch (InstantiationException | IllegalAccessException e) {
+			throw new ServiceException("Failed to resolve id field of snomed component.", e);
+		}
+
+		// Gather components changed on branch
+		String path = commit.getBranch().getPath();
+		Set<String> componentsChangedOnBranch = new HashSet<>();
+		NativeSearchQueryBuilder changesQueryBuilder = new NativeSearchQueryBuilder().withQuery(
+				changesOnBranchCriteria.getEntityBranchCriteria(componentClass)
+				.must(clause))
+				.withFields(idField)
+				.withPageable(LARGE_PAGE);
+		try (CloseableIterator<T> stream = elasticsearchTemplate.stream(changesQueryBuilder.build(), componentClass)) {
+			stream.forEachRemaining(component -> {
+				componentsChangedOnBranch.add(component.getId());
+			});
+		}
+
+		if (componentsChangedOnBranch.isEmpty()) {
+			return;
+		}
+
+		// Find duplicate versions brought in by rebase
+		Set<String> duplicateComponents = new HashSet<>();
+		NativeSearchQueryBuilder parentQueryBuilder = new NativeSearchQueryBuilder().withQuery(
+				branchCriteriaIncludingOpenCommit.getEntityBranchCriteria(componentClass)
+						.must(clause)
+						// Version must come from an ancestor branch
+						.mustNot(termQuery("path", path)))
+				.withFilter(termsQuery(idField, componentsChangedOnBranch))
+				.withFields(idField)
+				.withPageable(LARGE_PAGE);
+		try (CloseableIterator<T> stream = elasticsearchTemplate.stream(parentQueryBuilder.build(), componentClass)) {
+			stream.forEachRemaining(component -> {
+				duplicateComponents.add(component.getId());
+			});
+		}
+
+		if (!duplicateComponents.isEmpty()) {
+			// Favor the version of the component which has already been promoted by ending the version on this branch.
+			ElasticsearchCrudRepository repository = domainEntityConfiguration.getComponentTypeRepositoryMap().get(componentClass);
+			logger.info("Taking parent version of {} {}s on {}", duplicateComponents.size(), componentClass.getSimpleName(), path);
+			versionControlHelper.endOldVersionsOnThisBranch(componentClass, duplicateComponents, idField, clause, commit, repository);
 		}
 	}
 

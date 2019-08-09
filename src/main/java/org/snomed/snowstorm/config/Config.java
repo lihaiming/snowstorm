@@ -15,6 +15,8 @@ import org.apache.http.client.CredentialsProvider;
 import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
+import org.hl7.fhir.r4.model.ValueSet;
+import org.modelmapper.ModelMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.snomed.langauges.ecl.ECLQueryBuilder;
@@ -26,6 +28,7 @@ import org.snomed.snowstorm.core.data.domain.classification.EquivalentConcepts;
 import org.snomed.snowstorm.core.data.domain.classification.RelationshipChange;
 import org.snomed.snowstorm.core.data.domain.jobs.ExportConfiguration;
 import org.snomed.snowstorm.core.data.domain.jobs.IdentifiersForRegistration;
+import org.snomed.snowstorm.core.data.repositories.config.CodeSystemMixIn;
 import org.snomed.snowstorm.core.data.repositories.config.ConceptStoreMixIn;
 import org.snomed.snowstorm.core.data.repositories.config.DescriptionStoreMixIn;
 import org.snomed.snowstorm.core.data.repositories.config.RelationshipStoreMixIn;
@@ -36,6 +39,8 @@ import org.snomed.snowstorm.core.data.services.identifier.LocalIdentifierSource;
 import org.snomed.snowstorm.core.data.services.identifier.SnowstormCISClient;
 import org.snomed.snowstorm.core.rf2.rf2import.ImportService;
 import org.snomed.snowstorm.ecl.SECLObjectFactory;
+import org.snomed.snowstorm.fhir.domain.ValueSetDeserializer;
+import org.snomed.snowstorm.fhir.domain.ValueSetSerializer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -45,6 +50,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cloud.aws.autoconfigure.context.ContextStackAutoConfiguration;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.PropertySource;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.elasticsearch.core.ElasticsearchTemplate;
 import org.springframework.data.elasticsearch.core.EntityMapper;
@@ -86,10 +92,12 @@ import static springfox.documentation.builders.PathSelectors.regex;
 @EnableElasticsearchRepositories(
 		basePackages = {
 				"org.snomed.snowstorm.core.data.repositories",
-				"io.kaicode.elasticvc.repositories"
+				"io.kaicode.elasticvc.repositories",
+				"org.snomed.snowstorm.fhir.repositories"
 		})
 
 @EnableConfigurationProperties
+@PropertySource(value = "classpath:application.properties", encoding = "UTF-8")
 @EnableAsync
 public abstract class Config {
 
@@ -131,7 +139,7 @@ public abstract class Config {
 
 	@Autowired
 	private ElasticsearchTemplate elasticsearchTemplate;
-
+	
 	private Logger logger = LoggerFactory.getLogger(getClass());
 
 	@PostConstruct
@@ -140,11 +148,23 @@ public abstract class Config {
 		branchService.addCommitListener(conceptDefinitionStatusUpdateService);
 		branchService.addCommitListener(semanticIndexUpdateService);
 		branchService.addCommitListener(traceabilityLogService);
+		branchService.addCommitListener(commit -> {
+			logger.info("Completed commit on {} in {} seconds.", commit.getBranch().getPath(), secondsDuration(commit.getTimepoint()));
+		});
+	}
+
+	private String secondsDuration(Date timepoint) {
+		return "" + (float) (new Date().getTime() - timepoint.getTime()) / 1000f;
 	}
 
 	@Bean
 	public ExecutorService taskExecutor() {
 		return Executors.newCachedThreadPool();
+	}
+
+	@Bean
+	public ModelMapper modelMapper() {
+		return new ModelMapper();
 	}
 
 	@Bean
@@ -185,9 +205,12 @@ public abstract class Config {
 				.failOnUnknownProperties(false)
 				.serializationInclusion(JsonInclude.Include.NON_NULL)
 				.mixIn(Branch.class, BranchStoreMixIn.class)
+				.mixIn(CodeSystem.class, CodeSystemMixIn.class)
 				.mixIn(Concept.class, ConceptStoreMixIn.class)
 				.mixIn(Description.class, DescriptionStoreMixIn.class)
 				.mixIn(Relationship.class, RelationshipStoreMixIn.class)
+				.serializerByType(ValueSet.class, new ValueSetSerializer())
+				.deserializerByType(ValueSet.class, new ValueSetDeserializer())
 				.build();
 
 		EntityMapper entityMapper = new EntityMapper() {
@@ -211,7 +234,7 @@ public abstract class Config {
 				fastResultsMapper
 		);
 	}
-
+	
 	@Bean
 	public DomainEntityConfiguration domainEntityConfiguration() {
 		return new DomainEntityConfiguration();
@@ -303,6 +326,12 @@ public abstract class Config {
 	@ConfigurationProperties(prefix = "codesystem")
 	public CodeSystemConfigurationService getCodeSystemConfigurationService() {
 		return new CodeSystemConfigurationService();
+	}
+
+	@Bean
+	@ConfigurationProperties(prefix = "search.language")
+	public SearchLanguagesConfiguration searchLanguagesConfiguration() {
+		return new SearchLanguagesConfiguration();
 	}
 
 	@Bean

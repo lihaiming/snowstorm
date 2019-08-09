@@ -71,6 +71,7 @@ public class Concepts {
 	public static final String NONCONFORMANCE_TO_EDITORIAL_POLICY = "723277005";
 	public static final String NOT_SEMANTICALLY_EQUIVALENT = "723278000";
 
+	public static final String REFSET = "900000000000455006";
 	public static final String REFSET_SIMPLE = "446609009";
 
 	// Historical reference sets
@@ -171,5 +172,7 @@ public class Concepts {
 	// Notable concepts
 	public static final String CLINICAL_FINDING = "404684003";
 	public static final String SUBSTANCE = "105590001";
+	public static final String FINDING_SITE = "363698007";
+	public static final String HEART_STRUCTURE = "80891009";
 
 }

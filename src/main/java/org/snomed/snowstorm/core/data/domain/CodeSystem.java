@@ -1,17 +1,23 @@
 package org.snomed.snowstorm.core.data.domain;
 
+import org.snomed.snowstorm.core.data.domain.fieldpermissions.CodeSystemCreate;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.elasticsearch.annotations.Document;
 import org.springframework.data.elasticsearch.annotations.Field;
 import org.springframework.data.elasticsearch.annotations.FieldType;
 
+import javax.validation.constraints.NotNull;
+import javax.validation.constraints.Pattern;
+import java.util.Collection;
+import java.util.Map;
 import java.util.Objects;
 
 /**
  * Represents an edition or extension of SNOMED-CT
  */
 @Document(indexName = "codesystem")
-public class CodeSystem {
+public class CodeSystem implements CodeSystemCreate {
 
 	public interface Fields {
 		String SHORT_NAME = "shortName";
@@ -20,10 +26,31 @@ public class CodeSystem {
 
 	@Id
 	@Field(type = FieldType.keyword)
+	@NotNull
 	private String shortName;
 
 	@Field(type = FieldType.keyword)
+	private String name;
+
+	@Field(type = FieldType.keyword)
+	private String countryCode;
+
+	@Field(type = FieldType.keyword)
+	private String defaultLanguageCode;
+
+	@Field(type = FieldType.keyword)
+	@NotNull
+	@Pattern(regexp = "MAIN.*")
 	private String branchPath;
+
+	@Transient
+	private Map<String, String> languages;
+
+	@Transient
+	private Collection<ConceptMini> modules;
+
+	@Transient
+	private CodeSystemVersion latestVersion;
 
 	public CodeSystem() {
 	}
@@ -31,6 +58,13 @@ public class CodeSystem {
 	public CodeSystem(String shortName, String branchPath) {
 		this.shortName = shortName;
 		this.branchPath = branchPath;
+	}
+
+	public CodeSystem(String shortName, String branchPath, String name, String countryCode) {
+		this.shortName = shortName;
+		this.branchPath = branchPath;
+		this.name = name;
+		this.countryCode = countryCode;
 	}
 
 	public String getShortName() {
@@ -41,12 +75,60 @@ public class CodeSystem {
 		this.shortName = shortName;
 	}
 
+	public String getName() {
+		return name;
+	}
+
+	public void setName(String name) {
+		this.name = name;
+	}
+
+	public String getCountryCode() {
+		return countryCode;
+	}
+
+	public void setCountryCode(String countryCode) {
+		this.countryCode = countryCode;
+	}
+
+	public String getDefaultLanguageCode() {
+		return defaultLanguageCode;
+	}
+
+	public void setDefaultLanguageCode(String defaultLanguageCode) {
+		this.defaultLanguageCode = defaultLanguageCode;
+	}
+
 	public String getBranchPath() {
 		return branchPath;
 	}
 
 	public void setBranchPath(String branchPath) {
 		this.branchPath = branchPath;
+	}
+
+	public Map<String, String> getLanguages() {
+		return languages;
+	}
+
+	public void setLanguages(Map<String, String> languages) {
+		this.languages = languages;
+	}
+
+	public Collection<ConceptMini> getModules() {
+		return modules;
+	}
+
+	public void setModules(Collection<ConceptMini> modules) {
+		this.modules = modules;
+	}
+
+	public CodeSystemVersion getLatestVersion() {
+		return latestVersion;
+	}
+
+	public void setLatestVersion(CodeSystemVersion latestVersion) {
+		this.latestVersion = latestVersion;
 	}
 
 	@Override

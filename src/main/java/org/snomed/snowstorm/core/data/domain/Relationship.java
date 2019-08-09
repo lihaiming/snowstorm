@@ -238,6 +238,11 @@ public class Relationship extends SnomedComponent<Relationship> {
 		return this;
 	}
 
+	public Relationship setInferred(boolean inferred) {
+		this.characteristicTypeId = inferred ? Concepts.INFERRED_RELATIONSHIP : Concepts.STATED_RELATIONSHIP;
+		return this;
+	}
+
 	@JsonView(value = View.Component.class)
 	public String getModifier() {
 		return relationshipModifierNames.get(modifierId);
@@ -259,8 +264,9 @@ public class Relationship extends SnomedComponent<Relationship> {
 		return moduleId;
 	}
 
-	public void setModuleId(String moduleId) {
+	public Relationship setModuleId(String moduleId) {
 		this.moduleId = moduleId;
+		return this;
 	}
 
 	public String getSourceId() {

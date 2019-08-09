@@ -51,6 +51,7 @@ public class ReferenceSetMemberService extends ComponentService {
 
 	private static final Set<String> LANG_REFSET_MEMBER_FIELD_SET = Collections.singleton(ReferenceSetMember.LanguageFields.ACCEPTABILITY_ID);
 	private static final Set<String> OWL_REFSET_MEMBER_FIELD_SET = Collections.singleton(ReferenceSetMember.OwlExpressionFields.OWL_EXPRESSION);
+	public static final String AGGREGATION_MEMBER_COUNTS_BY_REFERENCE_SET = "memberCountsByReferenceSet";
 
 	@Autowired
 	private VersionControlHelper versionControlHelper;
@@ -92,9 +93,13 @@ public class ReferenceSetMemberService extends ComponentService {
 	 * @return	A page of matched reference set members.
 	 */
 	public Page<ReferenceSetMember> findMembers(String branch, MemberSearchRequest searchRequest, PageRequest pageRequest) {
-
 		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
+		BoolQueryBuilder query = buildMemberQuery(searchRequest, branch, branchCriteria);
+		return elasticsearchTemplate.queryForPage(new NativeSearchQueryBuilder()
+				.withQuery(query).withPageable(pageRequest).build(), ReferenceSetMember.class);
+	}
 
+	private BoolQueryBuilder buildMemberQuery(MemberSearchRequest searchRequest, String branch, BranchCriteria branchCriteria) {
 		BoolQueryBuilder query = boolQuery().must(branchCriteria.getEntityBranchCriteria(ReferenceSetMember.class));
 
 		if (searchRequest.getActive() != null) {
@@ -135,9 +140,7 @@ public class ReferenceSetMemberService extends ComponentService {
 				query.mustNot(gciClause);
 			}
 		}
-
-		return elasticsearchTemplate.queryForPage(new NativeSearchQueryBuilder()
-				.withQuery(query).withPageable(pageRequest).build(), ReferenceSetMember.class);
+		return query;
 	}
 
 	private ECLQueryService getEclQueryService() {
@@ -223,6 +226,7 @@ public class ReferenceSetMemberService extends ComponentService {
 							&& (member.getAdditionalFields().keySet().equals(LANG_REFSET_MEMBER_FIELD_SET))
 							|| Concepts.DESCRIPTION_INACTIVATION_INDICATOR_REFERENCE_SET.equals(member.getRefsetId())) {
 						// Lang refset or description inactivation indicator
+						// Save member so we can load it to lookup the conceptId
 						descriptionMembers.add(member);
 						descriptionIds.add(parseLong(member.getReferencedComponentId()));
 
@@ -235,9 +239,10 @@ public class ReferenceSetMemberService extends ComponentService {
 				});
 
 		if (descriptionIds.size() != 0) {
+			// Lookup the conceptId of members which are considered part of the description
 			final NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder();
 
-			Long2ObjectMap<Description> descriptionMap = new Long2ObjectOpenHashMap<>();
+			Long2ObjectMap<Description> descriptionsFromStore = new Long2ObjectOpenHashMap<>();
 			for (List<Long> descriptionIdsSegment : Iterables.partition(descriptionIds, CLAUSE_LIMIT)) {
 				queryBuilder
 						.withQuery(boolQuery()
@@ -246,12 +251,12 @@ public class ReferenceSetMemberService extends ComponentService {
 						.withPageable(LARGE_PAGE);
 				try (final CloseableIterator<Description> descriptions = elasticsearchTemplate.stream(queryBuilder.build(), Description.class)) {
 					descriptions.forEachRemaining(description ->
-							descriptionMap.put(parseLong(description.getDescriptionId()), description));
+							descriptionsFromStore.put(parseLong(description.getDescriptionId()), description));
 				}
 			}
 
 			descriptionMembers.parallelStream().forEach(member -> {
-				Description description = descriptionMap.get(parseLong(member.getReferencedComponentId()));
+				Description description = descriptionsFromStore.get(parseLong(member.getReferencedComponentId()));
 				if (description == null) {
 					logger.warn("Refset member refers to description which does not exist, this will not be persisted {} -> {}", member.getId(), member.getReferencedComponentId());
 					members.remove(member);
@@ -353,18 +358,13 @@ public class ReferenceSetMemberService extends ComponentService {
 		return member;
 	}
 
-	public PageWithBucketAggregations<ReferenceSetMember> findReferenceSetMembersWithAggregations(String path, PageRequest pageRequest, Boolean activeMember) {
-
-		BranchCriteria branchCriteria  = versionControlHelper.getBranchCriteria(path);
-		BoolQueryBuilder boolQueryBuilder = boolQuery().must(branchCriteria.getEntityBranchCriteria(ReferenceSetMember.class));
-		if (activeMember != null) {
-			boolQueryBuilder.must(termsQuery(ReferenceSetMember.Fields.ACTIVE, activeMember.booleanValue()));
-		}
-
+	public PageWithBucketAggregations<ReferenceSetMember> findReferenceSetMembersWithAggregations(String branch, PageRequest pageRequest, MemberSearchRequest searchRequest) {
+		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
+		BoolQueryBuilder query = buildMemberQuery(searchRequest, branch, branchCriteria);
 		SearchQuery searchQuery = new NativeSearchQueryBuilder()
-				.withQuery(boolQueryBuilder)
+				.withQuery(query)
 				.withPageable(pageRequest)
-				.addAggregation(AggregationBuilders.terms("referenceSetIds").field(ReferenceSetMember.Fields.REFSET_ID).size(AGGREGATION_SEARCH_SIZE))
+				.addAggregation(AggregationBuilders.terms(AGGREGATION_MEMBER_COUNTS_BY_REFERENCE_SET).field(ReferenceSetMember.Fields.REFSET_ID).size(AGGREGATION_SEARCH_SIZE))
 				.build();
 
 		AggregatedPage<ReferenceSetMember> pageResults = (AggregatedPage<ReferenceSetMember>) elasticsearchTemplate.queryForPage(searchQuery, ReferenceSetMember.class);
@@ -376,4 +376,32 @@ public class ReferenceSetMemberService extends ComponentService {
 		return PageWithBucketAggregationsFactory.createPage(pageResults, aggregations);
 	}
 
+	public Map<String, String> findRefsetTypes(Set<String> referenceSetIds, BranchCriteria branchCriteria, String branch) {
+		List<Long> allRefsetTypes = getEclQueryService().selectConceptIds("<!" + Concepts.REFSET, branchCriteria, branch, false, LARGE_PAGE).getContent();
+
+		final NativeSearchQuery searchQuery = new NativeSearchQueryBuilder()
+				.withQuery(boolQuery()
+						.must(branchCriteria.getEntityBranchCriteria(QueryConcept.class))
+						.must(termsQuery(QueryConcept.Fields.CONCEPT_ID, referenceSetIds))
+						.must(termQuery("stated", false))
+				)
+				.withPageable(LARGE_PAGE)
+				.build();
+		final List<QueryConcept> concepts = elasticsearchTemplate.queryForPage(searchQuery, QueryConcept.class).getContent();
+
+		Map<String, String> refsetTypes = new HashMap<>();
+		for (QueryConcept concept : concepts) {
+			String conceptId = concept.getConceptIdL().toString();
+			if (allRefsetTypes.contains(concept.getConceptIdL())) {
+				refsetTypes.put(conceptId, conceptId);
+			} else {
+				for (Long ancestor : concept.getAncestors()) {
+					if (allRefsetTypes.contains(ancestor)) {
+						refsetTypes.put(conceptId, ancestor.toString());
+					}
+				}
+			}
+		}
+		return refsetTypes;
+	}
 }

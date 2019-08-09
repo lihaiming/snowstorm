@@ -16,9 +16,11 @@ public class Activity {
 	private Long commitTimestamp;
 	private Map<String, ConceptActivity> changes;
 
-	public Activity(String userId, String commitComment, String branchPath, Long commitTimestamp) {
+	public Activity() {
+	}
+
+	public Activity(String userId, String branchPath, Long commitTimestamp) {
 		this.userId = userId;
-		this.commitComment = commitComment;
 		this.branchPath = branchPath;
 		this.commitTimestamp = commitTimestamp;
 		changes = new HashMap<>();
@@ -51,11 +53,28 @@ public class Activity {
 		return changes;
 	}
 
+	public void setCommitComment(String commitComment) {
+		this.commitComment = commitComment;
+	}
+
+	@Override
+	public String toString() {
+		return "Activity{" +
+				"userId='" + userId + '\'' +
+				", commitComment='" + commitComment + '\'' +
+				", branchPath='" + branchPath + '\'' +
+				", commitTimestamp=" + commitTimestamp +
+				'}';
+	}
+
 	public static final class ConceptActivity {
 
 		private Concept concept;
 		private Set<ComponentChange> changes;
 		private boolean statedChange;
+
+		public ConceptActivity() {
+		}
 
 		public ConceptActivity(Concept concept) {
 			this.concept = concept;
@@ -96,6 +115,9 @@ public class Activity {
 		private String componentType;
 		private String componentId;
 		private String type;
+
+		public ComponentChange() {
+		}
 
 		public ComponentChange(String componentType, String componentId, String type) {
 			this.componentType = componentType;

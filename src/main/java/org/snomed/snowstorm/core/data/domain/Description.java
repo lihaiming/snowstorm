@@ -26,6 +26,7 @@ public class Description extends SnomedComponent<Description> implements SnomedC
 	public interface Fields extends SnomedComponent.Fields {
 		String DESCRIPTION_ID = "descriptionId";
 		String TERM = "term";
+		String TERM_FOLDED = "termFolded";
 		String TERM_LEN = "termLen";
 		String TAG = "tag";
 		String CONCEPT_ID = "conceptId";
@@ -34,14 +35,17 @@ public class Description extends SnomedComponent<Description> implements SnomedC
 	}
 
 	@JsonView(value = View.Component.class)
-	@Field(type = FieldType.keyword)
+	@Field(type = FieldType.keyword, store = true)
 	@Size(min = 5, max = 18)
 	private String descriptionId;
 
 	@JsonView(value = View.Component.class)
-	@Field(type = FieldType.text)
+	@Field(type = FieldType.keyword)
 	@NotNull
 	private String term;
+
+	@Field(type = FieldType.text)
+	private String termFolded;
 
 	@Field(type = FieldType.Integer)
 	private int termLen;
@@ -177,8 +181,9 @@ public class Description extends SnomedComponent<Description> implements SnomedC
 		return languageCode;
 	}
 
-	public void setLang(String languageCode) {
+	public Description setLang(String languageCode) {
 		this.languageCode = languageCode;
+		return this;
 	}
 
 	public Description clearLanguageRefsetMembers() {
@@ -313,6 +318,14 @@ public class Description extends SnomedComponent<Description> implements SnomedC
 		}
 	}
 
+	public String getTermFolded() {
+		return termFolded;
+	}
+
+	public void setTermFolded(String termFolded) {
+		this.termFolded = termFolded;
+	}
+
 	public void setTermLen(int termLen) {
 		this.termLen = termLen;
 	}
@@ -370,8 +383,9 @@ public class Description extends SnomedComponent<Description> implements SnomedC
 		return caseSignificanceId;
 	}
 
-	public void setCaseSignificanceId(String caseSignificanceId) {
+	public Description setCaseSignificanceId(String caseSignificanceId) {
 		this.caseSignificanceId = caseSignificanceId;
+		return this;
 	}
 
 	public ReferenceSetMember getInactivationIndicatorMember() {

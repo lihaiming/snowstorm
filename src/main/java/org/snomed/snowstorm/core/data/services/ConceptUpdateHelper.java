@@ -8,11 +8,15 @@ import io.kaicode.elasticvc.domain.Commit;
 import io.kaicode.elasticvc.domain.DomainEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.snomed.snowstorm.config.SearchLanguagesConfiguration;
 import org.snomed.snowstorm.core.data.domain.*;
-import org.snomed.snowstorm.core.data.repositories.*;
+import org.snomed.snowstorm.core.data.repositories.ConceptRepository;
+import org.snomed.snowstorm.core.data.repositories.DescriptionRepository;
+import org.snomed.snowstorm.core.data.repositories.RelationshipRepository;
 import org.snomed.snowstorm.core.data.services.identifier.IdentifierReservedBlock;
 import org.snomed.snowstorm.core.data.services.identifier.IdentifierService;
 import org.snomed.snowstorm.core.data.services.pojo.PersistedComponents;
+import org.snomed.snowstorm.core.util.DescriptionHelper;
 import org.snomed.snowstorm.core.util.MapUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
@@ -21,10 +25,6 @@ import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilde
 import org.springframework.data.util.CloseableIterator;
 import org.springframework.stereotype.Service;
 
-import javax.validation.ConstraintViolation;
-import javax.validation.Validation;
-import javax.validation.Validator;
-import javax.validation.ValidatorFactory;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -32,6 +32,7 @@ import java.util.stream.Stream;
 
 import static org.elasticsearch.index.query.QueryBuilders.boolQuery;
 import static org.elasticsearch.index.query.QueryBuilders.termsQuery;
+import static org.snomed.snowstorm.core.data.domain.Concepts.inactivationIndicatorNames;
 
 @Service
 public class ConceptUpdateHelper extends ComponentService {
@@ -52,6 +53,9 @@ public class ConceptUpdateHelper extends ComponentService {
 	private AxiomConversionService axiomConversionService;
 
 	@Autowired
+	private SearchLanguagesConfiguration searchLanguagesConfiguration;
+
+	@Autowired
 	private VersionControlHelper versionControlHelper;
 
 	@Autowired
@@ -60,13 +64,10 @@ public class ConceptUpdateHelper extends ComponentService {
 	@Autowired
 	private IdentifierService identifierService;
 
-	private final ValidatorFactory validatorFactory;
+	@Autowired
+	private ValidatorService validatorService;
 
 	private Logger logger = LoggerFactory.getLogger(getClass());
-
-	public ConceptUpdateHelper() {
-		validatorFactory = Validation.buildDefaultValidatorFactory();
-	}
 
 	PersistedComponents saveNewOrUpdatedConcepts(Collection<Concept> concepts, Commit commit, Map<String, Concept> existingConceptsMap) throws ServiceException {
 		final boolean savingMergedConcepts = commit.isRebase();
@@ -98,11 +99,13 @@ public class ConceptUpdateHelper extends ComponentService {
 			} else {
 				// Make relationships and axioms inactive
 				concept.getRelationships().forEach(relationship -> relationship.setActive(false));
+				concept.getDescriptions().forEach(description -> description.setInactivationIndicator(inactivationIndicatorNames.get(Concepts.CONCEPT_NON_CURRENT)));
 				newVersionOwlAxiomMembers.forEach(axiom -> axiom.setActive(false));
 			}
 
 			// Mark changed concepts as changed
 			if (existingConcept != null) {
+				concept.setCreating(false);// May have been set true earlier during first save
 				concept.setChanged(concept.isComponentChanged(existingConcept) || savingMergedConcepts);
 				concept.copyReleaseDetails(existingConcept);
 				concept.updateEffectiveTime();
@@ -147,7 +150,9 @@ public class ConceptUpdateHelper extends ComponentService {
 					}
 				}
 				if (description.isActive()) {
-					description.setInactivationIndicator(null);
+					if (concept.isActive()) {
+						description.setInactivationIndicator(null);
+					}
 				} else {
 					description.clearLanguageRefsetMembers();
 				}
@@ -171,7 +176,6 @@ public class ConceptUpdateHelper extends ComponentService {
 						final ReferenceSetMember member = new ReferenceSetMember(existingMember.getMemberId(), null, true,
 								existingMember.getModuleId(), languageRefsetId, description.getId());
 						member.setAdditionalField("acceptabilityId", acceptabilityId);
-						member.setConceptId(concept.getConceptId());
 
 						if (member.isComponentChanged(existingMember) || savingMergedConcepts) {
 							member.setChanged(true);
@@ -183,7 +187,6 @@ public class ConceptUpdateHelper extends ComponentService {
 					} else {
 						final ReferenceSetMember member = new ReferenceSetMember(description.getModuleId(), languageRefsetId, description.getId());
 						member.setAdditionalField("acceptabilityId", acceptabilityId);
-						member.setConceptId(concept.getConceptId());
 						member.setChanged(true);
 						refsetMembersToPersist.add(member);
 					}
@@ -227,12 +230,21 @@ public class ConceptUpdateHelper extends ComponentService {
 	}
 
 	private void validateConcepts(Collection<Concept> concepts) {
-		Validator validator = validatorFactory.getValidator();
+		validatorService.validate(concepts);
 		for (Concept concept : concepts) {
-			Set<ConstraintViolation<Concept>> violations = validator.validate(concept);
-			if (!violations.isEmpty()) {
-				ConstraintViolation<Concept> violation = violations.iterator().next();
-				throw new IllegalArgumentException(String.format("Invalid concept property %s %s", violation.getPropertyPath().toString(), violation.getMessage()));
+			for (Axiom gciAxiom : Optional.ofNullable(concept.getGciAxioms()).orElse(Collections.emptySet())) {
+				boolean parentFound = false;
+				boolean attributeFound = false;
+				for (Relationship relationship : gciAxiom.getRelationships()) {
+					if (Concepts.ISA.equals(relationship.getTypeId())) {
+						parentFound = true;
+					} else {
+						attributeFound = true;
+					}
+				}
+				if (!parentFound || !attributeFound) {
+					throw new IllegalArgumentException("The relationships of a GCI axiom must include at least one parent and one attribute.");
+				}
 			}
 		}
 	}
@@ -304,7 +316,7 @@ public class ConceptUpdateHelper extends ComponentService {
 		}
 		if (newIndicator != null && !newIndicator.equals(existingIndicator)) {
 			// Create new indicator
-			String newIndicatorId = Concepts.inactivationIndicatorNames.inverse().get(newIndicator);
+			String newIndicatorId = inactivationIndicatorNames.inverse().get(newIndicator);
 			if (newIndicatorId == null) {
 				throw new IllegalArgumentException(newComponent.getClass().getSimpleName() + " inactivation indicator not recognised '" + newIndicator + "'.");
 			}
@@ -360,6 +372,11 @@ public class ConceptUpdateHelper extends ComponentService {
 	 * Persists description updates within commit.
 	 */
 	public void doSaveBatchDescriptions(Collection<Description> descriptions, Commit commit) {
+		Map<String, Set<Character>> charactersNotFoldedSets = searchLanguagesConfiguration.getCharactersNotFoldedSets();
+		for (Description description : descriptions) {
+			description.setTermFolded(DescriptionHelper.foldTerm(description.getTerm(),
+					charactersNotFoldedSets.getOrDefault(description.getLanguageCode(), Collections.emptySet())));
+		}
 		doSaveBatchComponents(descriptions, commit, "descriptionId", descriptionRepository);
 	}
 
@@ -405,6 +422,7 @@ public class ConceptUpdateHelper extends ComponentService {
 			final C existingComponent = map.get(newComponent.getId());
 			newComponent.setChanged(newComponent.isComponentChanged(existingComponent) || rebase);
 			if (existingComponent != null) {
+				newComponent.setCreating(false);// May have been set true earlier
 				newComponent.copyReleaseDetails(existingComponent);
 				newComponent.updateEffectiveTime();
 			} else {

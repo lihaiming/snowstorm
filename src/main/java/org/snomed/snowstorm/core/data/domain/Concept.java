@@ -4,7 +4,10 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 import com.fasterxml.jackson.annotation.JsonView;
 import com.google.common.collect.Sets;
+import org.snomed.snowstorm.core.pojo.TermLangPojo;
+import org.snomed.snowstorm.core.util.DescriptionHelper;
 import org.snomed.snowstorm.rest.View;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.elasticsearch.annotations.Document;
 import org.springframework.data.elasticsearch.annotations.Field;
 import org.springframework.data.elasticsearch.annotations.FieldType;
@@ -15,8 +18,10 @@ import javax.validation.constraints.Size;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import static org.snomed.snowstorm.core.util.DescriptionHelper.EN_LANGUAGE_CODE;
+
 @Document(indexName = "concept")
-@JsonPropertyOrder({"conceptId", "fsn", "active", "effectiveTime", "released", "releasedEffectiveTime",  "inactivationIndicator", "associationTargets",
+@JsonPropertyOrder({"conceptId", "fsn", "pt", "active", "effectiveTime", "released", "releasedEffectiveTime",  "inactivationIndicator", "associationTargets",
 		"moduleId", "definitionStatus", "definitionStatusId", "descriptions", "classAxioms", "gciAxioms", "relationships"})
 public class Concept extends SnomedComponent<Concept> implements ConceptView, SnomedComponentWithInactivationIndicator, SnomedComponentWithAssociations {
 
@@ -30,7 +35,6 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 	@Field(type = FieldType.keyword, store = true)
 	@Size(min = 5, max = 18)
 	private String conceptId;
-
 	@JsonIgnore
 	private ReferenceSetMember inactivationIndicatorMember;
 
@@ -62,9 +66,15 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 	@Valid
 	private Set<Relationship> relationships;
 
+	@Transient
 	private Set<Axiom> classAxioms;
 
+	@Transient
 	private Set<Axiom> generalConceptInclusionAxioms;
+
+	@Transient
+	@JsonIgnore
+	private List<String> requestedLanguages;
 
 	public Concept() {
 		active = true;
@@ -120,13 +130,14 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 
 	@JsonView(value = View.Component.class)
 	@Override
-	public String getFsn() {
-		for (Description description : descriptions) {
-			if (description.isActive() && description.getTypeId().equals(Concepts.FSN)) {
-				return description.getTerm();
-			}
-		}
-		return null;
+	public TermLangPojo getFsn() {
+		return DescriptionHelper.getFsnDescriptionTermAndLang(descriptions, requestedLanguages != null ? requestedLanguages : EN_LANGUAGE_CODE);
+	}
+
+	@JsonView(value = View.Component.class)
+	@Override
+	public TermLangPojo getPt() {
+		return DescriptionHelper.getPtDescriptionTermAndLang(descriptions, requestedLanguages != null ? requestedLanguages : EN_LANGUAGE_CODE);
 	}
 
 	@JsonView(value = View.Component.class)
@@ -215,6 +226,13 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 	}
 
 	public Concept addGeneralConceptInclusionAxiom(Axiom axiom) {
+		axiom.getRelationships().forEach(r -> r.setSourceId(this.conceptId));
+		generalConceptInclusionAxioms.add(axiom);
+		return this;
+	}
+
+	public Concept addGeneralConceptInclusionAxiom(Relationship... axiomFragments) {
+		Axiom axiom = new Axiom(moduleId, true, Concepts.PRIMITIVE, Sets.newHashSet(axiomFragments));
 		axiom.getRelationships().forEach(r -> r.setSourceId(this.conceptId));
 		generalConceptInclusionAxioms.add(axiom);
 		return this;
@@ -310,8 +328,9 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 		return moduleId;
 	}
 
-	public void setModuleId(String moduleId) {
+	public Concept setModuleId(String moduleId) {
 		this.moduleId = moduleId;
+		return this;
 	}
 
 	@Override
@@ -360,6 +379,10 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 
 	public void setGciAxioms(Set<Axiom> generalConceptInclusionAxioms) {
 		this.generalConceptInclusionAxioms = generalConceptInclusionAxioms;
+	}
+
+	public void setRequestedLanguages(List<String> requestedLanguages) {
+		this.requestedLanguages = requestedLanguages;
 	}
 
 	@Override

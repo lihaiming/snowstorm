@@ -6,14 +6,15 @@ import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.rest.util.branchpathrewrite.BranchPathUriUtil;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import org.snomed.snowstorm.core.data.domain.Concept;
 import org.snomed.snowstorm.core.data.domain.ConceptMini;
 import org.snomed.snowstorm.core.data.domain.ConceptView;
 import org.snomed.snowstorm.core.data.domain.Relationship;
 import org.snomed.snowstorm.core.data.domain.expression.Expression;
-import org.snomed.snowstorm.core.data.domain.expression.ExpressionTransfer;
 import org.snomed.snowstorm.core.data.services.*;
 import org.snomed.snowstorm.core.data.services.pojo.AsyncConceptChangeBatch;
+import org.snomed.snowstorm.core.data.services.pojo.MapPage;
 import org.snomed.snowstorm.core.data.services.pojo.ResultMapPage;
 import org.snomed.snowstorm.core.pojo.BranchTimepoint;
 import org.snomed.snowstorm.rest.pojo.*;
@@ -48,6 +49,9 @@ public class ConceptController {
 	private QueryService queryService;
 
 	@Autowired
+	private SemanticIndexService semanticIndexService;
+
+	@Autowired
 	private ExpressionService expressionService;
 
 	@Autowired
@@ -60,6 +64,7 @@ public class ConceptController {
 			@RequestParam(required = false) Boolean activeFilter,
 			@RequestParam(required = false) String definitionStatusFilter,
 			@RequestParam(required = false) String term,
+			@RequestParam(required = false) Boolean termActive,
 			@RequestParam(required = false) String ecl,
 			@RequestParam(required = false) String statedEcl,
 			@RequestParam(required = false) Set<String> conceptIds,
@@ -67,6 +72,25 @@ public class ConceptController {
 			@RequestParam(required = false, defaultValue = "50") int limit,
 			@RequestParam(required = false) String searchAfter,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
+
+		// Parameter validation
+		int logicalMethods = 0;
+		if (ecl != null) {
+			logicalMethods++;
+		}
+		if (statedEcl != null) {
+			logicalMethods++;
+		}
+		if (conceptIds != null) {
+			logicalMethods++;
+		}
+		if (logicalMethods > 1) {
+			throw new IllegalArgumentException("Parameters ecl, statedEcl and conceptIds can not be combined.");
+		}
+
+		if ((ecl != null || statedEcl != null) && activeFilter != null && !activeFilter) {
+			throw new IllegalArgumentException("ECL search can not be used on inactive concepts.");
+		}
 
 		boolean stated = true;
 		if (ecl != null && !ecl.isEmpty()) {
@@ -77,13 +101,14 @@ public class ConceptController {
 
 		QueryService.ConceptQueryBuilder queryBuilder = queryService.createQueryBuilder(stated)
 				.activeFilter(activeFilter)
+				.termActive(termActive)
 				.definitionStatusFilter(definitionStatusFilter)
 				.ecl(ecl)
 				.termMatch(term)
 				.languageCodes(ControllerHelper.getLanguageCodes(acceptLanguageHeader))
 				.conceptIds(conceptIds);
 
-		validatePageSize(limit);
+		ControllerHelper.validatePageSize(offset, limit);
 
 		return new ItemsPage<>(queryService.search(queryBuilder, BranchPathUriUtil.decodePath(branch), ControllerHelper.getPageRequest(offset, searchAfter, limit)));
 	}
@@ -111,6 +136,7 @@ public class ConceptController {
 				searchRequest.getActiveFilter(),
 				searchRequest.getDefinitionStatusFilter(),
 				searchRequest.getTermFilter(),
+				searchRequest.getTermActive(),
 				searchRequest.getEclFilter(),
 				searchRequest.getStatedEclFilter(),
 				searchRequest.getConceptIds(),
@@ -129,8 +155,9 @@ public class ConceptController {
 			@RequestParam(defaultValue = "100") int size,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
 
-		validatePageSize(size);
-		return conceptService.findAll(BranchPathUriUtil.decodePath(branch), ControllerHelper.getLanguageCodes(acceptLanguageHeader), PageRequest.of(number, size));
+		PageRequest pageRequest = PageRequest.of(number, size);
+		ControllerHelper.validatePageSize(pageRequest.getOffset(), pageRequest.getPageSize());
+		return conceptService.findAll(BranchPathUriUtil.decodePath(branch), ControllerHelper.getLanguageCodes(acceptLanguageHeader), pageRequest);
 	}
 
 	@RequestMapping(value = "/browser/{branch}/concepts/bulk-load", method = RequestMethod.POST)
@@ -182,7 +209,7 @@ public class ConceptController {
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
 
 		String ecl = "<" + conceptId;
-		return findConcepts(branch, null, null, null, !stated ? ecl : null, stated ? ecl : null, null, offset, limit, null, acceptLanguageHeader);
+		return findConcepts(branch, null, null, null, null, !stated ? ecl : null, stated ? ecl : null, null, offset, limit, null, acceptLanguageHeader);
 	}
 
 	@ResponseBody
@@ -191,6 +218,42 @@ public class ConceptController {
 	public InboundRelationshipsResult findConceptInboundRelationships(@PathVariable String branch, @PathVariable String conceptId) {
 		List<Relationship> inboundRelationships = relationshipService.findInboundRelationships(conceptId, BranchPathUriUtil.decodePath(branch), null).getContent();
 		return new InboundRelationshipsResult(inboundRelationships);
+	}
+
+	@ApiOperation(value = "Find concepts which reference this concept in the inferred or stated form (including stated axioms).",
+			notes = "Pagination works on the referencing concepts. A referencing concept may have one or more references of different types.")
+	@ResponseBody
+	@RequestMapping(value = "/{branch}/concepts/{conceptId}/references", method = RequestMethod.GET)
+	public ConceptReferencesResult findConceptReferences(
+			@PathVariable String branch,
+			@PathVariable Long conceptId,
+			@RequestParam(defaultValue = "false") boolean stated,
+			@RequestParam(required = false, defaultValue = "0") int offset,
+			@RequestParam(required = false, defaultValue = "1000") int limit,
+			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
+
+		branch = BranchPathUriUtil.decodePath(branch);
+		ControllerHelper.validatePageSize(offset, limit);
+
+		MapPage<Long, Set<Long>> conceptReferencesPage = semanticIndexService.findConceptReferences(branch, conceptId, stated, ControllerHelper.getPageRequest(offset, limit));
+		Map<Long, Set<Long>> conceptReferences = conceptReferencesPage.getMap();
+
+		// Join concept minis with FSN and PT
+		Set<Long> allConceptIds = new LongOpenHashSet();
+		for (Long typeId : conceptReferences.keySet()) {
+			allConceptIds.add(typeId);
+			allConceptIds.addAll(conceptReferences.get(typeId));
+		}
+		Map<String, ConceptMini> conceptMiniMap = conceptService.findConceptMinis(branch, allConceptIds, ControllerHelper.getLanguageCodes(acceptLanguageHeader)).getResultsMap();
+		Set<TypeReferences> typeSets = new TreeSet<>(Comparator.comparing((type) -> type.getReferenceType().getFsnTerm()));
+		for (Long typeId : conceptReferences.keySet()) {
+			ArrayList<ConceptMini> referencingConcepts = new ArrayList<>();
+			typeSets.add(new TypeReferences(conceptMiniMap.get(typeId.toString()), referencingConcepts));
+			for (Long referencingConceptId : conceptReferences.get(typeId)) {
+				referencingConcepts.add(conceptMiniMap.get(referencingConceptId.toString()));
+			}
+		}
+		return new ConceptReferencesResult(typeSets, conceptReferencesPage.getPageable(), conceptReferencesPage.getTotalElements());
 	}
 
 	@ResponseBody
@@ -303,7 +366,7 @@ public class ConceptController {
 	
 	@ResponseBody
 	@RequestMapping(value = "/{branch}/concepts/{conceptId}/normal-form", method = RequestMethod.GET)
-	public ExpressionTransfer getConceptNormalForm(
+	public ExpressionStringPojo getConceptNormalForm(
 			@PathVariable String branch,
 			@PathVariable String conceptId,
 			@RequestParam(defaultValue="false") boolean statedView,
@@ -312,13 +375,7 @@ public class ConceptController {
 
 		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
 		Expression expression =  expressionService.getConceptNormalForm(conceptId, languageCodes, BranchPathUriUtil.decodePath(branch), statedView);
-		return ExpressionTransfer.transfer(expression, includeTerms);
-	}
-
-	private void validatePageSize(@RequestParam(required = false, defaultValue = "50") int limit) {
-		if (limit > 10_000) {
-			throw new IllegalArgumentException("Maximum page size is 10000.");
-		}
+		return new ExpressionStringPojo(expression.toString(includeTerms));
 	}
 
 }

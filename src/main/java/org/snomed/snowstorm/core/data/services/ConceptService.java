@@ -164,7 +164,9 @@ public class ConceptService extends ComponentService {
 
 	private BranchCriteria getBranchCriteria(BranchTimepoint branchTimepoint) {
 		if (branchTimepoint.isBranchCreationTimepoint()) {
-			return versionControlHelper.getBranchCriteriaAtBranchCreation(branchTimepoint.getBranchPath());
+			return versionControlHelper.getBranchCriteriaAtBranchCreationTimepoint(branchTimepoint.getBranchPath());
+		} else if (branchTimepoint.isBranchBaseTimepoint()) {
+			return versionControlHelper.getBranchCriteriaAtBranchBaseTimepoint(branchTimepoint.getBranchPath());
 		} else if (branchTimepoint.getTimepoint() != null) {
 			return versionControlHelper.getBranchCriteriaAtTimepoint(branchTimepoint.getBranchPath(), branchTimepoint.getTimepoint());
 		} else {
@@ -247,6 +249,9 @@ public class ConceptService extends ComponentService {
 					.withQuery(boolQuery().must(branchCriteria.getEntityBranchCriteria(Concept.class)))
 					.withPageable(pageRequest);
 			concepts = elasticsearchTemplate.queryForPage(queryBuilder.build(), Concept.class);
+		}
+		for (Concept concept : concepts) {
+			concept.setRequestedLanguages(languageCodes);
 		}
 		timer.checkpoint("find concept");
 

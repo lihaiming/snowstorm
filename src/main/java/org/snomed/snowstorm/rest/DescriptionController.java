@@ -9,7 +9,6 @@ import org.snomed.snowstorm.core.data.domain.Description;
 import org.snomed.snowstorm.core.data.services.ConceptService;
 import org.snomed.snowstorm.core.data.services.DescriptionService;
 import org.snomed.snowstorm.core.data.services.pojo.PageWithBucketAggregations;
-import org.snomed.snowstorm.core.data.services.pojo.ResultMapPage;
 import org.snomed.snowstorm.rest.pojo.BrowserDescriptionSearchResult;
 import org.snomed.snowstorm.rest.pojo.ItemsPage;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -37,8 +36,13 @@ public class DescriptionController {
 	public Page<BrowserDescriptionSearchResult> findBrowserDescriptions(
 			@PathVariable String branch,
 			@RequestParam(required = false) String term,
-			@RequestParam(required = false) Boolean conceptActive,
+			@RequestParam(required = false) Boolean active,
+			@RequestParam(required = false) String module,
 			@RequestParam(required = false) String semanticTag,
+			@RequestParam(required = false) Boolean conceptActive,
+			@RequestParam(required = false) String conceptRefset,
+			@RequestParam(defaultValue = "false") boolean groupByConcept,
+			@RequestParam(defaultValue = "STANDARD") DescriptionService.SearchMode searchMode,
 			@RequestParam(defaultValue = "0") int offset,
 			@RequestParam(defaultValue = "50") int limit,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
@@ -49,10 +53,15 @@ public class DescriptionController {
 		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
 
 		PageWithBucketAggregations<Description> page = descriptionService.findDescriptionsWithAggregations(
-				// Query
-				branch, term,
-				// Filters
-				conceptActive, semanticTag,
+				branch,
+				// Description clauses
+				term, active, module, semanticTag,
+				// Concept clauses
+				conceptActive, conceptRefset,
+				// Grouping
+				groupByConcept,
+				//search mode
+				searchMode,
 				// Language and page
 				languageCodes, pageRequest);
 
@@ -60,7 +69,7 @@ public class DescriptionController {
 		Map<String, ConceptMini> conceptMinis = conceptService.findConceptMinis(branch, conceptIds, languageCodes).getResultsMap();
 
 		List<BrowserDescriptionSearchResult> results = new ArrayList<>();
-		page.getContent().forEach(d -> results.add(new BrowserDescriptionSearchResult(d.getTerm(), d.isActive(), conceptMinis.get(d.getConceptId()))));
+		page.getContent().forEach(d -> results.add(new BrowserDescriptionSearchResult(d.getTerm(), d.isActive(), d.getLanguageCode(), d.getModuleId(), conceptMinis.get(d.getConceptId()))));
 
 		PageWithBucketAggregations<BrowserDescriptionSearchResult> pageWithBucketAggregations = new PageWithBucketAggregations<>(results, page.getPageable(), page.getTotalElements(), page.getBuckets());
 		addBucketConcepts(branch, languageCodes, pageWithBucketAggregations);
@@ -86,8 +95,7 @@ public class DescriptionController {
 	@JsonView(value = View.Component.class)
 	public ItemsPage<Description> findDescriptions(@PathVariable String branch,
 			@RequestParam(required = false) @ApiParam("The concept id to match") String concept,
-			@RequestParam(defaultValue = "0") int offset, @RequestParam(defaultValue = "50") int limit,
-			@RequestHeader("Accept-Language") String acceptLanguage) {
+			@RequestParam(defaultValue = "0") int offset, @RequestParam(defaultValue = "50") int limit) {
 
 		branch = BranchPathUriUtil.decodePath(branch);
 		return new ItemsPage<>(descriptionService.findDescriptions(branch, null, concept, ControllerHelper.getPageRequest(offset, limit)));

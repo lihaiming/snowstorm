@@ -4,8 +4,13 @@
 
 Snowstorms's FHIR capabilities are managed using the HAPI Server package, which brings a number of benefits such as automatic creation of the Capabilities resource. It also means that future releases of the FHIR Specification will not require code changes by SNOMED International as we'll be able migrate to the next version of HAPI.
 
+
+
 # Testing
-Unfortunately HAPI does not easily support a Swagger interface for testing, and if you find a way to make it work do please let us know!
+Unfortunately HAPI does not easily support a Swagger interface for testing, but if you are used to working with **[Postman](https://www.getpostman.com/downloads/)**, here is a Postman project to try out some of the FHIR API calls.
+
+[![Run in Postman](https://run.pstmn.io/button.svg)](https://app.getpostman.com/run-collection/4aa97fbcc6a6ccd0e94c)
+
 
 In a default installation, the FHIR endpoints can be found at: http://localhost:8080/fhir  although there is no operation there, so you could try one of these calls:
 
@@ -26,6 +31,23 @@ http://localhost:8080/fhir/CodeSystem/$lookup?system=http://snomed.info/sct&code
 #### Code System Lookup of 427623005 |Obstetric umbilical artery Doppler (procedure)| in Swedish Extension
 ####  Curl example allows use of language headers to specify Swedish language. NB Ensure use of single quotes in URL to avoid $lookup being treated as a variable by Unix shell
 curl -i -H 'Accept-Language: sv' 'http://localhost:8080/fhir/CodeSystem/$lookup?system=http://snomed.info/sct&version=http://snomed.info/sct/45991000052106&code=427623005&_format=json'
+
+## ValueSet create, update and delete
+
+#### Upload or update a valueset json file:
+curl -i --request PUT "http://localhost:8080/fhir/ValueSet/address-use" \
+--header "Content-Type: application/fhir+json" \
+-d @exampleVs.json
+
+#### Expand a valueset which has an ECL expression in its url element
+http://localhost:8080/fhir/ValueSet/chronic-disease/$expand?includeDesignations=true&_format=json
+
+#### Recover a valueset eg address-use
+http://localhost:8080/fhir/ValueSet/address-use?_format=json
+
+#### Delete a valueset
+curl --request DELETE "http://localhost:8080/fhir/ValueSet/address-use" 
+
 
 ## ValueSet Expansion
 ### Implicit ValueSets (ie intensionally defined). 
@@ -63,7 +85,10 @@ http://localhost:8080/fhir/ValueSet/$expand?url=http://snomed.info/sct?fhir_vs=e
 localhost:8080/fhir/ConceptMap/$translate?code=134811001&system=http://snomed.info/sct&source=http://snomed.info/sct?fhir_vs&target=http://snomed.info/sct?fhir_vs&url=http://snomed.info/sct?fhir_cm=900000000000527005&_format=json
 
 #### Find ICD-10 Map target for 254153009 |Familial expansile osteolysis (disorder)|
-http://localhost:8080/fhir/ConceptMap/$translate?code=254153009&system=http://snomed.info/sct&source=http://snomed.info/sct?fhir_vs&target=ICD-10&url=http://snomed.info/sct?fhir_cm=447562003&_format=json
+http://localhost:8080/fhir/ConceptMap/$translate?code=254153009&system=http://snomed.info/sct&source=http://snomed.info/sct?fhir_vs&target=http://hl7.org/fhir/sid/icd-10&url=http://snomed.info/sct?fhir_cm=447562003&_format=json
+
+#### Find SNOMED CT concepts that have a particular ICD-10 code as their map target.  This reverse lookup is not medically safe, as the SI ICD-10 map is unidirectional by design.
+http://localhost:8080/fhir/ConceptMap/$translate?code=Q79.8&system=http://hl7.org/fhir/sid/icd-10&source=http://hl7.org/fhir/sid/icd-10&target=http://snomed.info/sct&_format=json
 
 #### Find all Maps target for 254153009 |Familial expansile osteolysis (disorder)| - note fhir_cm value is left blank so all refsets are potentially returned.
 http://localhost:8080/fhir/ConceptMap/$translate?code=254153009&system=http://snomed.info/sct&source=http://snomed.info/sct?fhir_vs&target=http://snomed.info/sct?fhir_vs&url=http://snomed.info/sct?fhir_cm=&_format=json

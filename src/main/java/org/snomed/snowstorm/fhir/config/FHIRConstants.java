@@ -14,6 +14,8 @@ public interface FHIRConstants {
 	String DESIGNATION = "designation";
 	StringType DISPLAY = new StringType("display");
 	StringType EFFECTIVE_TIME = new StringType("effectiveTime");
+	
+	static final int NOT_SET = -1;
 
 	String FHIR = "FHIR";
 
@@ -27,6 +29,8 @@ public interface FHIRConstants {
 	String SNOMED_EDITION = "SNOMED CT International Edition";
 	String SNOMED_INTERNATIONAL = "SNOMED International";
 	String SNOMED_URI = "http://snomed.info/sct";
+	String ICD10 = "ICD-10";
+	String ICD10_URI = "http://hl7.org/fhir/sid/icd-10";
 	String SNOMED_CONCEPTMAP = SNOMED_URI + "?fhir_cm=";
 	
 	enum Validation { EQUALS, STARTS_WITH }

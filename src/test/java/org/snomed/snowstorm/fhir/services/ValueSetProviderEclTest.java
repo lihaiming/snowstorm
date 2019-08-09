@@ -15,7 +15,7 @@ import static org.junit.Assert.assertTrue;
 
 @RunWith(SpringRunner.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = TestConfig.class)
-public class ValueSetProviderTest extends AbstractFHIRTest {
+public class ValueSetProviderEclTest extends AbstractFHIRTest {
 	
 	@Test
 	public void testECLRecovery_DescOrSelf() throws FHIROperationException {
@@ -83,10 +83,11 @@ public class ValueSetProviderTest extends AbstractFHIRTest {
 		ValueSet v = get(url);
 		assertEquals(11,v.getExpansion().getTotal());
 		
-		// ?fhir_vs=refset -> all concepts (all concepts exist in lang refsets!)
+		// ?fhir_vs=refset -> all concepts representing refsets
+		// This is 3 - two language refsets plus our test data
 		url = "http://localhost:" + port + "/fhir/ValueSet/$expand?url=http://snomed.info/sct?fhir_vs=refset&_format=json";
 		v = get(url);
-		assertEquals(11,v.getExpansion().getTotal());
+		assertEquals(3,v.getExpansion().getTotal());
 		
 		// ?fhir_vs=isa/<root concept> -> all concepts under root plus self
 		url = "http://localhost:" + port + "/fhir/ValueSet/$expand?url=http://snomed.info/sct?fhir_vs=isa/" + Concepts.SNOMEDCT_ROOT + "&_format=json";
