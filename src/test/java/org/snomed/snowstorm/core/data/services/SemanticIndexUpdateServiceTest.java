@@ -9,7 +9,6 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.snomed.otf.owltoolkit.conversion.ConversionException;
 import org.snomed.snowstorm.AbstractTest;
 import org.snomed.snowstorm.TestConfig;
 import org.snomed.snowstorm.config.Config;
@@ -30,7 +29,6 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 import static io.kaicode.elasticvc.api.ComponentService.LARGE_PAGE;
-import static java.lang.Long.parseLong;
 import static org.junit.Assert.assertEquals;
 import static org.snomed.snowstorm.core.data.domain.Concepts.*;
 
@@ -46,6 +44,9 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 	@Autowired
 	private BranchService branchService;
+
+	@Autowired
+	private BranchMergeService branchMergeService;
 
 	@Autowired
 	private ConceptService conceptService;
@@ -289,7 +290,7 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 		String branch = "MAIN";
 		conceptService.batchCreate(Lists.newArrayList(root, a, aa, aaa, ab, ac, acc, accc), branch);
 
-		assertTC(accc, a, aa, aaa, ac, acc, acc, root);
+		assertTC(accc, a, aa, aaa, ac, acc, root);
 		assertTC(ac, a, root);
 
 		ac.getRelationships().clear();
@@ -298,7 +299,7 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 
 		assertTC(ac, ab, a, root);
 		// After 'ac' is updated descendant 'accc' should gain ancestor 'ab' but should not loose existing ancestors from alternative routes e.g. 'aa'.
-		assertTC(accc, a, aa, aaa, ac, acc, acc, ab, root);
+		assertTC(accc, a, aa, aaa, ac, acc, ab, root);
 	}
 
 	@Test
@@ -325,8 +326,8 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 		assertTC(n14, n12, n11, root);
 	}
 
-	@Test
-	public void testCircularReference() throws ServiceException {
+	@Test(expected = IllegalStateException.class)
+	public void testCircularReferenceInNormalCommitThrowsException() throws ServiceException {
 		Concept root = new Concept(SNOMEDCT_ROOT);
 
 		Concept n11 = new Concept("1000011").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
@@ -339,6 +340,34 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 	}
 
 	@Test
+	public void testCircularReferenceCreatedDuringRebaseDoesNotBreak() throws ServiceException {
+		// On MAIN
+		Concept root = new Concept(SNOMEDCT_ROOT);
+		Concept cA = new Concept("1000011").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		Concept cB = new Concept("1000012").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT));
+		// C -> B
+		Concept cC = new Concept("1000013").addRelationship(new Relationship(ISA, cB.getId()));
+		conceptService.batchCreate(Lists.newArrayList(root, cA, cB, cC), "MAIN");
+
+		// On MAIN/A
+		// B -> A
+		cB.addRelationship(new Relationship(ISA, cA.getId()));
+		branchService.create("MAIN/A");
+		conceptService.update(cB, "MAIN/A");
+
+		// On MAIN
+		// A -> C
+		cA.addRelationship(new Relationship(ISA, cC.getId()));
+		conceptService.update(cA, "MAIN");
+
+		// Rebase causes the loop
+		branchMergeService.mergeBranchSync("MAIN", "MAIN/A", Collections.emptySet());
+
+		Page<ConceptMini> concepts = queryService.eclSearch(">1000012", true, "MAIN/A", PageRequest.of(0, 10));
+		assertEquals("[138875005, 1000013, 1000011]", concepts.getContent().stream().map(ConceptMini::getConceptId).collect(Collectors.toList()).toString());
+	}
+
+	@Test
 	public void inactiveConceptsNotAdded() throws ServiceException {
 		String path = "MAIN";
 		conceptService.create(new Concept(SNOMEDCT_ROOT), path);
@@ -346,7 +375,7 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 		ambulanceman.setActive(false);
 		conceptService.create(ambulanceman, path);
 
-		Page<ConceptMini> concepts = queryService.search(queryService.createQueryBuilder(true).descendant(parseLong(SNOMEDCT_ROOT)), path, PAGE_REQUEST);
+		Page<ConceptMini> concepts = queryService.search(queryService.createQueryBuilder(true).ecl("<" + SNOMEDCT_ROOT), path, PAGE_REQUEST);
 		assertEquals(0, concepts.getTotalElements());
 	}
 
@@ -356,13 +385,13 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 		conceptService.create(new Concept(SNOMEDCT_ROOT), path);
 		Concept ambulanceman = conceptService.create(new Concept("10000123").addFSN("Ambulanceman").addRelationship(new Relationship(ISA, SNOMEDCT_ROOT)), path);
 
-		Page<ConceptMini> concepts = queryService.search(queryService.createQueryBuilder(true).selfOrDescendant(parseLong(SNOMEDCT_ROOT)).termMatch("Amb"), path, PAGE_REQUEST);
+		Page<ConceptMini> concepts = queryService.search(queryService.createQueryBuilder(true).ecl("<<" + SNOMEDCT_ROOT).termMatch("Amb"), path, PAGE_REQUEST);
 		assertEquals(1, concepts.getTotalElements());
 
 		ambulanceman.setActive(false);
 		conceptService.update(ambulanceman, path);
 
-		concepts = queryService.search(queryService.createQueryBuilder(true).selfOrDescendant(parseLong(SNOMEDCT_ROOT)).termMatch("Amb"), path, PAGE_REQUEST);
+		concepts = queryService.search(queryService.createQueryBuilder(true).ecl("<<" + SNOMEDCT_ROOT).termMatch("Amb"), path, PAGE_REQUEST);
 		assertEquals(0, concepts.getTotalElements());
 	}
 
@@ -457,7 +486,7 @@ public class SemanticIndexUpdateServiceTest extends AbstractTest {
 	}
 
 	@Test
-	public void testRebuildSemanticIndexWithSameTripleActiveAndInactiveOnSameDate() throws ServiceException, InterruptedException, ConversionException {
+	public void testRebuildSemanticIndexWithSameTripleActiveAndInactiveOnSameDate() throws ServiceException, InterruptedException {
 		String path = "MAIN";
 		List<Concept> concepts = new ArrayList<>();
 

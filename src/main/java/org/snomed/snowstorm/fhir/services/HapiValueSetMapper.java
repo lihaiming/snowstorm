@@ -31,7 +31,6 @@ public class HapiValueSetMapper implements FHIRConstants {
 		for (ConceptMini concept : concepts) {
 			ValueSetExpansionContainsComponent component = expansion.addContains()
 				.setCode(concept.getConceptId())
-				.setDisplay(concept.getFsnTerm())
 				.setSystem(SNOMED_URI);
 			
 			if (conceptDetails != null && conceptDetails.containsKey(concept.getConceptId())) {
@@ -40,13 +39,8 @@ public class HapiValueSetMapper implements FHIRConstants {
 					if (includeDesignations && languageCodes.contains(d.getLanguageCode())) {
 						component.addDesignation(asDesignation(d));
 					}
-					//Are we mising the FSN in the conceptMini?
-					if (component.getDisplay() == null && d.getTypeId().equals(Concepts.FSN)) {
-						component.setDisplay(d.getTerm());
-					}
 					
-					//Was request for a specific display language?
-					//Use the preferred term in that language if so.
+					//Use the preferred term in the specified display language.
 					if (d.getLanguageCode().equalsIgnoreCase(displayLanguage) &&
 							d.hasAcceptability(Concepts.PREFERRED) &&
 							d.getTypeId().equals(Concepts.SYNONYM)) {

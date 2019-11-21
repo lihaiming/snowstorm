@@ -67,7 +67,7 @@ public class ConceptControllerTest extends AbstractTest {
 						.addDescription(new Description("Wallace \"69\" side-to-end anastomosis - action")
 								.setTypeId(Concepts.SYNONYM)
 								.addLanguageRefsetMember(Concepts.US_EN_LANG_REFSET, Concepts.PREFERRED))
-						.addAxiom(new Relationship(Concepts.ISA, Concepts.CLINICAL_FINDING)),
+						.addAxiom(new Relationship(Concepts.ISA, Concepts.SNOMEDCT_ROOT)),
 				"MAIN");
 
 		// Add 1 second sleeps because the timepoint URI format uses second as the finest level
@@ -75,7 +75,7 @@ public class ConceptControllerTest extends AbstractTest {
 
 		// Create a project branch and add a relationship to the dummy concept
 		branchService.create("MAIN/projectA");
-		concept.getRelationships().add(new Relationship(Concepts.ISA, Concepts.SNOMEDCT_ROOT));
+		concept.getRelationships().add(new Relationship(Concepts.ISA, Concepts.CLINICAL_FINDING));
 		concept = conceptService.update(concept, "MAIN/projectA");
 
 		Thread.sleep(1_000);
@@ -118,11 +118,11 @@ public class ConceptControllerTest extends AbstractTest {
 		assertEquals(1, intermediateConceptVersion.getRelationships().size());
 		assertEquals(2, intermediateConceptVersion.getDescriptions().size());
 
-		// Load base version of the concept
+		// Load base version of the concept (from parent branch)
 		timepoint = "@^";
 		Concept baseConceptVersion = this.restTemplate.getForObject("http://localhost:" + port + "/browser/MAIN/projectA" + timepoint + "/concepts/257751006", Concept.class);
-		assertEquals(1, baseConceptVersion.getRelationships().size());
-		assertEquals(3, baseConceptVersion.getDescriptions().size());
+		assertEquals(0, baseConceptVersion.getRelationships().size());
+		assertEquals(0, baseConceptVersion.getDescriptions().size());
 
 		// Load current version of dummy concept
 		timepoint = "";

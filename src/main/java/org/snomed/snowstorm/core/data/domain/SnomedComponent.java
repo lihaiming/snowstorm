@@ -17,6 +17,8 @@ public abstract class SnomedComponent<C> extends DomainEntity<C> implements IdAn
 		String EFFECTIVE_TIME = "effectiveTimeI";
 		String ACTIVE = "active";
 		String MODULE_ID = "moduleId";
+		String RELEASED = "released";
+		String RELEASE_HASH = "releaseHash";
 	}
 
 	@JsonView(value = View.Component.class)

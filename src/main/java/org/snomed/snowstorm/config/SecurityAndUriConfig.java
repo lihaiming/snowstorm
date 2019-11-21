@@ -13,7 +13,6 @@ import org.snomed.snowstorm.rest.config.CodeSystemVersionMixIn;
 import org.snomed.snowstorm.rest.config.PageMixin;
 import org.snomed.snowstorm.rest.pojo.BranchPojo;
 import org.snomed.snowstorm.rest.security.RequestHeaderAuthenticationDecoratorWithRequiredRole;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -26,10 +25,25 @@ import org.springframework.security.config.annotation.web.builders.WebSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configuration.WebSecurityConfigurerAdapter;
 import org.springframework.security.config.annotation.web.configurers.ExpressionUrlAuthorizationConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.firewall.DefaultHttpFirewall;
 import org.springframework.security.web.firewall.HttpFirewall;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
+import springfox.documentation.builders.ApiInfoBuilder;
+import springfox.documentation.builders.RequestHandlerSelectors;
+import springfox.documentation.service.ApiInfo;
+import springfox.documentation.service.Contact;
+import springfox.documentation.spi.DocumentationType;
+import springfox.documentation.spring.web.plugins.ApiSelectorBuilder;
+import springfox.documentation.spring.web.plugins.Docket;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+
+import static com.google.common.base.Predicates.not;
+import static springfox.documentation.builders.PathSelectors.regex;
 
 @Configuration
 @EnableWebSecurity
@@ -38,8 +52,11 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 	@Value("${snowstorm.rest-api.readonly}")
 	private boolean restApiReadOnly;
 
-	@Autowired
-	private List<String> allowReadOnlyPostEndpointPrefixes;
+	@Value("${snowstorm.rest-api.readonly.allowReadOnlyPostEndpoints}")
+	private boolean restApiAllowReadOnlyPostEndpoints;
+
+	@Value("${ims-security.roles.enabled}")
+	private boolean rolesEnabled;
 
 	@Bean
 	public ObjectMapper getGeneralMapper() {
@@ -65,6 +82,8 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 				"/branches/(.*)/actions/.*",
 				"/branches/(.*)",
 				"/rebuild/(.*)",
+				"/browser/(.*)/validate/concept",
+				"/browser/(.*)/validate/concepts",
 				"/browser/(.*)/concepts.*",
 				"/browser/(.*)/descriptions.*",
 				"/browser/(.*)/members.*",
@@ -76,9 +95,10 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 				"/(.*)/classifications.*",
 				"/(.*)/integrity-check",
 				"/(.*)/integrity-check-full",
+				"/(.*)/report/.*",
+				"/(.*)/authoring-stats.*",
 				"/mrcm/(.*)/domain-attributes",
 				"/mrcm/(.*)/attribute-values.*",
-				"/browser/(.*)/validate/concept",
 				"/admin/(.*)/actions/.*"
 		));
 	}
@@ -92,12 +112,23 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 
 
 	@Override
-	public void configure(WebSecurity web) throws Exception {
+	public void configure(WebSecurity web) {
 		web.httpFirewall(allowUrlEncodedSlashHttpFirewall());
+	}
+
+	@Bean
+	public List<String> allowReadOnlyPostEndpointPrefixes() {
+		return Collections.singletonList("/fhir");
+	}
+
+	@Bean
+	public List<String> allowReadOnlyPostEndpoints() {
+		return Collections.singletonList("/browser/{branch}/concepts/bulk-load");
 	}
 
 	@Override
 	protected void configure(HttpSecurity http) throws Exception {
+		http.sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS);
 		http.csrf().disable();
 
 		if (restApiReadOnly) {
@@ -105,7 +136,10 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 
 			// Allow some explicitly defined endpoints
 			ExpressionUrlAuthorizationConfigurer<HttpSecurity>.ExpressionInterceptUrlRegistry authorizeRequests = http.authorizeRequests();
-			allowReadOnlyPostEndpointPrefixes.forEach(prefix -> authorizeRequests.antMatchers(HttpMethod.POST, prefix + "/**").anonymous());
+			allowReadOnlyPostEndpointPrefixes().forEach(prefix -> authorizeRequests.antMatchers(HttpMethod.POST, prefix + "/**").anonymous());
+			if (restApiAllowReadOnlyPostEndpoints) {
+				allowReadOnlyPostEndpoints().forEach(endpoint -> authorizeRequests.antMatchers(HttpMethod.POST, endpoint).anonymous());
+			}
 
 			// Block all other POST/PUT/PATCH/DELETE
 			authorizeRequests
@@ -114,7 +148,132 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 					.antMatchers(HttpMethod.PATCH, "/**").denyAll()
 					.antMatchers(HttpMethod.DELETE, "/**").denyAll()
 					.anyRequest().anonymous();
+		} else if (rolesEnabled) {
+			http.authorizeRequests()
+					.antMatchers("/admin/**").hasRole("snowstorm-admin")// ROLE_snowstorm-admin
+					.antMatchers(HttpMethod.PUT, "/codesystems/**").hasRole("snowstorm-admin")
+					.antMatchers(HttpMethod.POST, "/codesystems/**").hasRole("snowstorm-admin")
+					.anyRequest().permitAll();
 		}
+	}
+
+	/*
+	@Bean
+	// Swagger config
+	public Docket api() {
+		Docket docket = new Docket(DocumentationType.SWAGGER_2);
+		docket.apiInfo(new ApiInfo("Snowstorm", "SNOMED CT Terminology Server REST API", "1.0", null, new Contact("SNOMED International", "https://github.com/IHTSDO/snowstorm", null), "Apache 2.0", "http://www.apache.org/licenses/LICENSE-2.0"));
+		ApiSelectorBuilder apiSelectorBuilder = docket.select();
+
+		if (restApiReadOnly) {
+			// Read-only mode
+			List<String> allowReadOnlyPostEndpointPrefixes = allowReadOnlyPostEndpointPrefixes();
+			List<String> allowReadOnlyPostEndpoints = allowReadOnlyPostEndpoints();
+
+			apiSelectorBuilder
+					.apis(requestHandler -> {
+						// Hide POST/PUT/PATCH/DELETE
+						if (requestHandler != null) {
+							RequestMappingInfo requestMapping = requestHandler.getRequestMapping();
+							// Allow FHIR endpoints with GET method (even if endpoint has POST too)
+							if (requestMapping.getPatternsCondition().getPatterns()
+									.stream().
+											anyMatch(pattern -> allowReadOnlyPostEndpointPrefixes
+													.stream()
+													.anyMatch(pattern::startsWith))
+									&& requestMapping.getMethodsCondition().getMethods().contains(RequestMethod.GET)) {
+								return true;
+							}
+							if (restApiAllowReadOnlyPostEndpoints) {
+								// Allow specific endpoints with POST method
+								if (requestMapping.getPatternsCondition().getPatterns()
+										.stream().
+												anyMatch(pattern -> allowReadOnlyPostEndpoints
+														.stream()
+														.anyMatch(pattern::equals))
+										&& requestMapping.getMethodsCondition().getMethods().contains(RequestMethod.POST)) {
+									return true;
+								}
+							}
+							Set<RequestMethod> methods = requestMapping.getMethodsCondition().getMethods();
+							return !methods.contains(RequestMethod.POST) && !methods.contains(RequestMethod.PUT)
+									&& !methods.contains(RequestMethod.PATCH) && !methods.contains(RequestMethod.DELETE);
+						}
+						return false;
+					})
+					// Also hide endpoints related to authoring
+					.paths(not(regex("/merge.*")))
+					.paths(not(regex("/review.*")))
+					//.paths(not(regex("/exports.*")))
+					//.paths(not(regex("/imports.*")));
+		} else {
+			// Not read-only mode, allow everything!
+			apiSelectorBuilder
+					.apis(RequestHandlerSelectors.any());
+		}
+
+		// Don't show the error or root endpoints in swagger
+		apiSelectorBuilder
+				.paths(not(regex("/error")))
+				.paths(not(regex("/")));
+
+		return apiSelectorBuilder.build();
+	}
+	*/
+	@Bean
+	public Docket api() {
+		Docket docket = new Docket(DocumentationType.SWAGGER_2);
+
+		docket.apiInfo(apiInfo(
+				"Snowstorm, for JY Medical Information Technology",
+				"SNOMED CT Terminology Server REST API",
+				"1.0",
+				null,
+				new Contact("SNOMED International", "https://github.com/IHTSDO/snowstorm", null),
+				"Apache 2.0",
+				"http://www.apache.org/licenses/LICENSE-2.0"));
+
+		ApiSelectorBuilder apiSelectorBuilder = docket.select();
+
+		if (restApiReadOnly) {
+			// Read-only mode
+			List<String> allowReadOnlyPostEndpointPrefixes = allowReadOnlyPostEndpointPrefixes();
+
+			apiSelectorBuilder
+					.apis(requestHandler -> {
+						// Hide POST/PUT/PATCH/DELETE
+						if (requestHandler != null) {
+							// Allow FHIR endpoints with GET method (even if endpoint has POST too)
+							RequestMappingInfo requestMapping = requestHandler.getRequestMapping();
+							if (requestMapping.getPatternsCondition().getPatterns().stream()
+									.filter(pattern -> allowReadOnlyPostEndpointPrefixes.stream().filter(pattern::startsWith).count() > 0).count() > 0
+									&& requestMapping.getMethodsCondition().getMethods().contains(RequestMethod.GET)) {
+								return true;
+							}
+							Set<RequestMethod> methods = requestMapping.getMethodsCondition().getMethods();
+							return !methods.contains(RequestMethod.POST) && !methods.contains(RequestMethod.PUT)
+									&& !methods.contains(RequestMethod.PATCH) && !methods.contains(RequestMethod.DELETE);
+						}
+						return false;
+					})
+					// Also hide endpoints related to authoring
+					.paths(not(regex("/merge.*")))
+					.paths(not(regex("/review.*")))
+					.paths(not(regex(".*/classification.*")))
+					.paths(not(regex("/exports.*")))
+					.paths(not(regex("/imports.*")));
+		} else {
+			// Not read-only mode, allow everything!
+			apiSelectorBuilder
+					.apis(RequestHandlerSelectors.any());
+		}
+
+		// Don't show the error or root endpoints in swagger
+		apiSelectorBuilder
+				.paths(not(regex("/error")))
+				.paths(not(regex("/")));
+
+		return apiSelectorBuilder.build();
 	}
 
 	@Bean
@@ -133,6 +292,21 @@ public class SecurityAndUriConfig extends WebSecurityConfigurerAdapter {
 		);
 		filterRegistrationBean.setOrder(2);
 		return filterRegistrationBean;
+	}
+
+	/** */
+	private ApiInfo apiInfo(String title, String description, String version, String termsOfServiceUrl, Contact contact, String license, String licenseUrl) {
+
+		return new ApiInfoBuilder()
+				.title(title)
+				.description(description)
+				.version(version)
+				.contact(contact)
+				.termsOfServiceUrl(termsOfServiceUrl)
+				.license(license)
+				.licenseUrl(licenseUrl)
+				.build();
+
 	}
 
 }

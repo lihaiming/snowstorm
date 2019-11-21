@@ -7,10 +7,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Assert;
 import org.junit.Test;
-import org.snomed.snowstorm.core.data.domain.Concept;
-import org.snomed.snowstorm.core.data.domain.ConceptView;
-import org.snomed.snowstorm.core.data.domain.Description;
-import org.snomed.snowstorm.core.data.domain.Relationship;
+import org.snomed.snowstorm.core.data.domain.*;
 import org.snomed.snowstorm.core.data.repositories.config.ConceptStoreMixIn;
 import org.snomed.snowstorm.core.data.repositories.config.DescriptionStoreMixIn;
 import org.snomed.snowstorm.core.data.repositories.config.RelationshipStoreMixIn;
@@ -58,7 +55,9 @@ public class ConceptSerialisationTest {
 	@Test
 	public void testRESTApiSerialisation() throws JsonProcessingException {
 		ObjectWriter restApiWriter = generalObjectMapper.writerWithView(View.Component.class).forType(ConceptView.class);
-		final String conceptJson = restApiWriter.writeValueAsString(new Concept("123", null, true, "33", "900000000000074008"));
+		Concept concept = new Concept("123", null, true, "33", "900000000000074008");
+		concept.setDescendantCount(123L);
+		final String conceptJson = restApiWriter.writeValueAsString(concept);
 		System.out.println(conceptJson);
 		assertFalse(conceptJson.contains("internalId"));
 		assertFalse(conceptJson.contains("path"));
@@ -67,6 +66,7 @@ public class ConceptSerialisationTest {
 		assertFalse(conceptJson.contains("effectiveTimeI"));
 		assertFalse(conceptJson.contains("releaseHash"));
 		assertFalse(conceptJson.contains("allOwlAxiomMembers"));
+		assertFalse(conceptJson.contains("descendantCount"));
 
 		assertTrue(conceptJson.contains("fsn"));
 		assertTrue(conceptJson.contains("pt"));
@@ -78,8 +78,14 @@ public class ConceptSerialisationTest {
 
 	@Test
 	public void testStoreSerialisation() throws JsonProcessingException {
-		final String conceptJson = storeObjectMapper.writeValueAsString(new Concept("123", null, true, "33", "900000000000074008"));
+		// Dummy data to serialise
+		Concept concept = new Concept("123", null, true, "33", "900000000000074008");
+		concept.setDescendantCount(123L);
+
+		final String conceptJson = storeObjectMapper.writeValueAsString(concept);
 		System.out.println(conceptJson);
+
+		// Concept fields which should not be serialised
 		assertFalse(conceptJson.contains("fsn"));
 		assertFalse(conceptJson.contains("\"fsn\""));
 		assertFalse(conceptJson.contains("\"pt\""));
@@ -91,6 +97,7 @@ public class ConceptSerialisationTest {
 		assertFalse(conceptJson.contains("gciAxioms"));
 		assertFalse(conceptJson.contains("allOwlAxiomMembers"));
 		assertFalse(conceptJson.contains("associationTargets"));
+		assertFalse(conceptJson.contains("descendantCount"));
 
 		assertTrue(conceptJson.contains("internalId"));
 		assertTrue(conceptJson.contains("path"));
@@ -98,6 +105,27 @@ public class ConceptSerialisationTest {
 		assertTrue(conceptJson.contains("end"));
 		assertTrue(conceptJson.contains("effectiveTimeI"));
 		assertTrue(conceptJson.contains("releaseHash"));
+
+
+		Description description = new Description("1234", 20200131, false, "123123", "123", "en", Concepts.FSN, "term", Concepts.ENTIRE_TERM_CASE_SENSITIVE);
+		description.addLanguageRefsetMember(Concepts.GB_EN_LANG_REFSET, Concepts.PREFERRED);
+
+		ReferenceSetMember inactivationIndicatorMember = new ReferenceSetMember();
+		inactivationIndicatorMember.setAdditionalField("valueId", Concepts.OUTDATED);
+		description.addInactivationIndicatorMember(inactivationIndicatorMember);
+
+		ReferenceSetMember member = new ReferenceSetMember("123123", Concepts.NOT_SEMANTICALLY_EQUIVALENT, "1234");
+		member.setAdditionalField("targetComponentId", "1231235");
+		description.addAssociationTargetMember(member);
+
+		final String descriptionJson = storeObjectMapper.writeValueAsString(description);
+		System.out.println(descriptionJson);
+		// Description fields (or name prefix) which should not be serialised
+		assertFalse(descriptionJson.contains("acceptability"));
+		assertFalse(descriptionJson.contains("inactivation"));
+		assertFalse(descriptionJson.contains("association"));
+
+
 	}
 
 }

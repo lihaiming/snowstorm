@@ -4,15 +4,28 @@ import ch.qos.logback.classic.Level;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import io.kaicode.elasticvc.api.BranchCriteria;
+import io.kaicode.elasticvc.api.BranchService;
 import io.kaicode.elasticvc.api.ComponentService;
 import io.kaicode.elasticvc.api.VersionControlHelper;
+import io.kaicode.elasticvc.domain.Branch;
+import io.kaicode.elasticvc.domain.Commit;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import org.apache.commons.lang.StringUtils;
+import org.apache.lucene.analysis.CharArraySet;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.Operator;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.SearchHits;
 import org.elasticsearch.search.aggregations.Aggregation;
 import org.elasticsearch.search.aggregations.AggregationBuilders;
+import org.elasticsearch.search.aggregations.bucket.terms.ParsedStringTerms;
+import org.elasticsearch.search.aggregations.bucket.terms.Terms;
 import org.elasticsearch.search.sort.SortBuilders;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,14 +36,17 @@ import org.snomed.snowstorm.core.data.services.mapper.ConceptToConceptIdMapper;
 import org.snomed.snowstorm.core.data.services.mapper.DescriptionToConceptIdGroupingMapper;
 import org.snomed.snowstorm.core.data.services.mapper.DescriptionToConceptIdMapper;
 import org.snomed.snowstorm.core.data.services.mapper.RefsetMemberToReferenceComponentIdMapper;
+import org.snomed.snowstorm.core.data.services.pojo.DescriptionCriteria;
 import org.snomed.snowstorm.core.data.services.pojo.PageWithBucketAggregations;
 import org.snomed.snowstorm.core.data.services.pojo.PageWithBucketAggregationsFactory;
 import org.snomed.snowstorm.core.data.services.pojo.SimpleAggregation;
 import org.snomed.snowstorm.core.util.DescriptionHelper;
 import org.snomed.snowstorm.core.util.TimerUtil;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.SearchResultMapper;
@@ -40,7 +56,9 @@ import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilde
 import org.springframework.data.util.CloseableIterator;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -59,7 +77,20 @@ public class DescriptionService extends ComponentService {
 	private VersionControlHelper versionControlHelper;
 
 	@Autowired
+	private BranchService branchService;
+
+	@Autowired
 	private ElasticsearchOperations elasticsearchTemplate;
+
+	@Autowired
+	private ConceptUpdateHelper conceptUpdateHelper;
+
+	private final Map<String, SemanticTagCacheEntry> semanticTagAggregationCache = new ConcurrentHashMap<>();
+
+	@Value("${search.description.aggregation.maxProcessableResultsSize}")
+	private int aggregationMaxProcessableResultsSize;
+
+	public static final Set<String> EN_LANGUAGE_CODES = Collections.singleton("en");
 
 	public enum SearchMode {
 		STANDARD, REGEX
@@ -78,10 +109,33 @@ public class DescriptionService extends ComponentService {
 			logger.error(message + " {}", descriptions);
 			throw new IllegalStateException(message);
 		}
+		// Join refset members
 		if (!descriptions.isEmpty()) {
-			return descriptions.get(0);
+			Description description = descriptions.get(0);
+			Map<String, Description> descriptionIdMap = Collections.singletonMap(descriptionId, description);
+			joinLangRefsetMembers(branchCriteria, Collections.singleton(description.getConceptId()), descriptionIdMap);
+			joinInactivationIndicatorsAndAssociations(null, descriptionIdMap, branchCriteria, null);
+			return description;
 		}
 		return null;
+	}
+
+	/**
+	 * Delete a description by id.
+	 * @param description The description to delete.
+	 * @param branch The branch on which to make the change.
+	 * @param force Delete the description even if it has been released.
+	 */
+	public void deleteDescription(Description description, String branch, boolean force) {
+		if (description.isReleased() && !force) {
+			throw new IllegalStateException("This description is released and can not be deleted.");
+		}
+		try (Commit commit = branchService.openCommit(branch)) {
+			description.markDeleted();
+			conceptUpdateHelper.doDeleteMembersWhereReferencedComponentDeleted(Collections.singleton(description.getDescriptionId()), commit);
+			conceptUpdateHelper.doSaveBatchDescriptions(Collections.singleton(description), commit);
+			commit.markSuccessful();
+		}
 	}
 
 	public Page<Description> findDescriptions(String branch, String exactTerm, String concept, PageRequest pageRequest) {
@@ -114,40 +168,43 @@ public class DescriptionService extends ComponentService {
 		return conceptMap.values().stream().flatMap(c -> c.getDescriptions().stream()).collect(Collectors.toSet());
 	}
 
-	PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path, String term, PageRequest pageRequest) {
-		return findDescriptionsWithAggregations(path, term, Collections.singleton("en"), pageRequest);
+	PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path, String term, PageRequest pageRequest) throws TooCostlyException {
+		return findDescriptionsWithAggregations(path, term, EN_LANGUAGE_CODES, pageRequest);
 	}
 
-	PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path, String term, Set<String> languageCodes, PageRequest pageRequest) {
-		return findDescriptionsWithAggregations(path, term, true, null, null, null, null, false, null, languageCodes, pageRequest);
+	PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path, String term, Set<String> languageCodes, PageRequest pageRequest) throws TooCostlyException {
+		return findDescriptionsWithAggregations(path, new DescriptionCriteria().term(term).searchLanguageCodes(languageCodes), pageRequest);
 	}
 
-	public PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path,
-			String term, Boolean active, String module, String semanticTag,
-			Boolean conceptActive, String conceptRefset, boolean groupByConcept, SearchMode searchMode, Collection<String> languageCodes, PageRequest pageRequest) {
-
-		TimerUtil timer = new TimerUtil("Search", Level.DEBUG);
+	public PageWithBucketAggregations<Description> findDescriptionsWithAggregations(String path, DescriptionCriteria criteria, PageRequest pageRequest) throws TooCostlyException {
+		TimerUtil timer = new TimerUtil("Search", Level.INFO, 5);
 		final BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(path);
 		timer.checkpoint("Build branch criteria");
 
 
 		// Build up the description criteria
-		final BoolQueryBuilder descriptionCriteria = boolQuery();
+		final BoolQueryBuilder descriptionQuery = boolQuery();
 		BoolQueryBuilder descriptionBranchCriteria = branchCriteria.getEntityBranchCriteria(Description.class);
-		descriptionCriteria.must(descriptionBranchCriteria);
-		addTermClauses(term, languageCodes, descriptionCriteria, searchMode);
+		descriptionQuery.must(descriptionBranchCriteria);
+		addTermClauses(criteria.getTerm(), criteria.getSearchLanguageCodes(), criteria.getType(), descriptionQuery, criteria.getSearchMode());
+
+		Boolean active = criteria.getActive();
 		if (active != null) {
-			descriptionCriteria.must(termQuery(Description.Fields.ACTIVE, active));
+			descriptionQuery.must(termQuery(Description.Fields.ACTIVE, active));
 		}
+
+		String module = criteria.getModule();
 		if (!Strings.isNullOrEmpty(module)) {
-			descriptionCriteria.must(termQuery(Description.Fields.MODULE_ID, module));
+			descriptionQuery.must(termQuery(Description.Fields.MODULE_ID, module));
 		}
 
 
 		// Fetch all matching description and concept ids
 		Collection<Long> descriptionIdsGroupedByConcept = new LongArrayList();
 		// ids of concepts where all descriptions and concept criteria are met
-		Collection<Long> conceptIds = findDescriptionConceptIds(descriptionCriteria, conceptActive, conceptRefset, groupByConcept, descriptionIdsGroupedByConcept, branchCriteria);
+		boolean groupByConcept = criteria.isGroupByConcept();
+		Collection<Long> conceptIds = findDescriptionConceptIds(descriptionQuery, criteria.getConceptActive(), criteria.getConceptRefset(), groupByConcept,
+				descriptionIdsGroupedByConcept, branchCriteria);
 
 		// Apply group by concept clause
 		BoolQueryBuilder descriptionFilter = boolQuery();
@@ -162,6 +219,7 @@ public class DescriptionService extends ComponentService {
 
 		// Fetch FSN aggregation
 		BoolQueryBuilder fsnClauses = boolQuery();
+		String semanticTag = criteria.getSemanticTag();
 		boolean semanticTagFiltering = !Strings.isNullOrEmpty(semanticTag);
 		if (semanticTagFiltering) {
 			fsnClauses.must(termQuery(Description.Fields.TAG, semanticTag));
@@ -210,7 +268,7 @@ public class DescriptionService extends ComponentService {
 		// Perform final paged description search with description property aggregations
 		descriptionFilter.must(termsQuery(Description.Fields.CONCEPT_ID, conceptIds));
 		final NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder()
-				.withQuery(descriptionCriteria
+				.withQuery(descriptionQuery
 						.filter(descriptionFilter))
 				.addAggregation(AggregationBuilders.terms("module").field(Description.Fields.MODULE_ID))
 				.addAggregation(AggregationBuilders.terms("language").field(Description.Fields.LANGUAGE_CODE))
@@ -249,10 +307,10 @@ public class DescriptionService extends ComponentService {
 					.withPageable(LARGE_PAGE);
 			try (final CloseableIterator<Description> descriptions = elasticsearchTemplate.stream(queryBuilder.build(), Description.class)) {
 				descriptions.forEachRemaining(description -> {
-					// Workaround - transient property sometimes persisted? FIXME
+					// Workaround - transient property used to be persisted.
 					description.setInactivationIndicator(null);
 
-					// Join Descriptions
+					// Join Descriptions to concepts for loading whole concepts use case.
 					final String descriptionConceptId = description.getConceptId();
 					if (conceptIdMap != null) {
 						final Concept concept = conceptIdMap.get(descriptionConceptId);
@@ -260,6 +318,7 @@ public class DescriptionService extends ComponentService {
 							concept.addDescription(description);
 						}
 					}
+					// Join Description to ConceptMinis for search result use case.
 					if (conceptMiniMap != null) {
 						final ConceptMini conceptMini = conceptMiniMap.get(descriptionConceptId);
 						if (conceptMini != null && description.isActive()) {
@@ -267,69 +326,123 @@ public class DescriptionService extends ComponentService {
 						}
 					}
 
-					// Store Descriptions for Lang Refset join
-					descriptionIdMap.put(description.getDescriptionId(), description);
+					// Store Descriptions in a map for adding Lang Refset and inactivation members.
+					descriptionIdMap.putIfAbsent(description.getDescriptionId(), description);
 				});
 			}
 		}
 		if (timer != null) timer.checkpoint("get descriptions " + getFetchCount(allConceptIds.size()));
 
-		// Fetch Inactivation Indicators and Associations
-		if (fetchInactivationInfo) {
-			Set<String> componentIds;
-			if (conceptIdMap != null) {
-				componentIds = Sets.union(conceptIdMap.keySet(), descriptionIdMap.keySet());
-			} else {
-				componentIds = descriptionIdMap.keySet();
-			}
-			for (List<String> componentIdsSegment : Iterables.partition(componentIds, CLAUSE_LIMIT)) {
-				queryBuilder.withQuery(boolQuery()
-						.must(branchCriteria.getEntityBranchCriteria(ReferenceSetMember.class))
-						.must(termsQuery("refsetId", Concepts.inactivationAndAssociationRefsets))
-						.must(termsQuery("referencedComponentId", componentIdsSegment)))
-						.withPageable(LARGE_PAGE);
-				// Join Members
-				try (final CloseableIterator<ReferenceSetMember> members = elasticsearchTemplate.stream(queryBuilder.build(), ReferenceSetMember.class)) {
-					members.forEachRemaining(member -> {
-						String referencedComponentId = member.getReferencedComponentId();
-						switch (member.getRefsetId()) {
-							case Concepts.CONCEPT_INACTIVATION_INDICATOR_REFERENCE_SET:
-								conceptIdMap.get(referencedComponentId).setInactivationIndicatorMember(member);
-								break;
-							case Concepts.DESCRIPTION_INACTIVATION_INDICATOR_REFERENCE_SET:
-								descriptionIdMap.get(referencedComponentId).setInactivationIndicatorMember(member);
-								break;
-							default:
-								if (IdentifierService.isConceptId(referencedComponentId)) {
-									Concept concept = conceptIdMap.get(referencedComponentId);
-									if (concept != null) {
-										concept.addAssociationTargetMember(member);
-									} else {
-										logger.warn("Association ReferenceSetMember {} references concept {} " +
-												"which is not in scope.", member.getId(), referencedComponentId);
-									}
-								} else if (IdentifierService.isDescriptionId(referencedComponentId)) {
-									Description description = descriptionIdMap.get(referencedComponentId);
-									if (description != null) {
-										description.addAssociationTargetMember(member);
-									} else {
-										logger.warn("Association ReferenceSetMember {} references concept {} " +
-												"which is not in scope.", member.getId(), referencedComponentId);
-									}
-								} else {
-									logger.error("Association ReferenceSetMember {} references unexpected component type {}", member.getId(), referencedComponentId);
-								}
-								break;
-						}
-					});
-				}
-			}
-			if (timer != null) timer.checkpoint("get inactivation refset " + getFetchCount(componentIds.size()));
-		}
-
 		// Fetch Lang Refset Members
 		joinLangRefsetMembers(branchCriteria, allConceptIds, descriptionIdMap);
 		if (timer != null) timer.checkpoint("get lang refset " + getFetchCount(allConceptIds.size()));
+
+		// Fetch Inactivation Indicators and Associations
+		if (fetchInactivationInfo) {
+			joinInactivationIndicatorsAndAssociations(conceptIdMap, descriptionIdMap, branchCriteria, timer);
+		}
+	}
+
+	public Map<String, Long> countActiveConceptsPerSemanticTag(String branch) {
+
+		Branch branchObject = branchService.findLatest(branch);
+
+		SemanticTagCacheEntry semanticTagCacheEntry = semanticTagAggregationCache.get(branch);
+		if (semanticTagCacheEntry != null) {
+			if (semanticTagCacheEntry.getBranchHeadTime() == branchObject.getHead().getTime()) {
+				return semanticTagCacheEntry.getTagCounts();
+			}
+		}
+
+		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
+
+		List<Long> activeConcepts = new LongArrayList();
+
+		try (CloseableIterator<Concept> stream = elasticsearchTemplate.stream(new NativeSearchQueryBuilder()
+				.withQuery(boolQuery()
+						.must(branchCriteria.getEntityBranchCriteria(Concept.class))
+						.must(termQuery(Concept.Fields.ACTIVE, true)))
+				.withStoredFields(Concept.Fields.CONCEPT_ID)
+				.withPageable(LARGE_PAGE).build(), Concept.class, new ConceptToConceptIdMapper(activeConcepts))) {
+			stream.forEachRemaining(concept -> {});
+		}
+
+		AggregatedPage<Description> page = (AggregatedPage<Description>) elasticsearchTemplate.queryForPage(new NativeSearchQueryBuilder()
+				.withQuery(boolQuery()
+						.must(branchCriteria.getEntityBranchCriteria(Description.class))
+						.must(termQuery(Description.Fields.ACTIVE, true))
+						.must(termQuery(Description.Fields.TYPE_ID, Concepts.FSN))
+						.filter(termsQuery(Description.Fields.CONCEPT_ID, activeConcepts))
+				)
+				.addAggregation(AggregationBuilders.terms("semanticTags").field(Description.Fields.TAG).size(AGGREGATION_SEARCH_SIZE))
+				.build(), Description.class);
+
+		Map<String, Long> tagCounts = new TreeMap<>();
+		ParsedStringTerms semanticTags = (ParsedStringTerms) page.getAggregation("semanticTags");
+		List<? extends Terms.Bucket> buckets = semanticTags.getBuckets();
+		for (Terms.Bucket bucket : buckets) {
+			tagCounts.put(bucket.getKeyAsString(), bucket.getDocCount());
+		}
+
+		// Cache result
+		semanticTagAggregationCache.put(branch, new SemanticTagCacheEntry(branchObject.getHead().getTime(), tagCounts));
+
+		return tagCounts;
+	}
+
+	private void joinInactivationIndicatorsAndAssociations(Map<String, Concept> conceptIdMap, Map<String, Description> descriptionIdMap,
+			BranchCriteria branchCriteria, TimerUtil timer) {
+
+		Set<String> componentIds;
+		if (conceptIdMap != null) {
+			componentIds = Sets.union(conceptIdMap.keySet(), descriptionIdMap.keySet());
+		} else {
+			componentIds = descriptionIdMap.keySet();
+		}
+		final NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder();
+		for (List<String> componentIdsSegment : Iterables.partition(componentIds, CLAUSE_LIMIT)) {
+			queryBuilder.withQuery(boolQuery()
+					.must(branchCriteria.getEntityBranchCriteria(ReferenceSetMember.class))
+					.must(termsQuery("refsetId", Concepts.inactivationAndAssociationRefsets))
+					.must(termsQuery("referencedComponentId", componentIdsSegment)))
+					.withPageable(LARGE_PAGE);
+			// Join Members
+			try (final CloseableIterator<ReferenceSetMember> members = elasticsearchTemplate.stream(queryBuilder.build(), ReferenceSetMember.class)) {
+				members.forEachRemaining(member -> {
+					String referencedComponentId = member.getReferencedComponentId();
+					switch (member.getRefsetId()) {
+						case Concepts.CONCEPT_INACTIVATION_INDICATOR_REFERENCE_SET:
+							conceptIdMap.get(referencedComponentId).addInactivationIndicatorMember(member);
+							break;
+						case Concepts.DESCRIPTION_INACTIVATION_INDICATOR_REFERENCE_SET:
+							descriptionIdMap.get(referencedComponentId).addInactivationIndicatorMember(member);
+							break;
+						default:
+							if (IdentifierService.isConceptId(referencedComponentId)) {
+								Concept concept = conceptIdMap.get(referencedComponentId);
+								if (concept != null) {
+									concept.addAssociationTargetMember(member);
+								} else {
+									logger.warn("Association ReferenceSetMember {} references concept {} " +
+											"which is not in scope.", member.getId(), referencedComponentId);
+								}
+							} else if (IdentifierService.isDescriptionId(referencedComponentId)) {
+								Description description = descriptionIdMap.get(referencedComponentId);
+								if (description != null) {
+									description.addAssociationTargetMember(member);
+								} else {
+									logger.warn("Association ReferenceSetMember {} references description {} " +
+											"which is not in scope.", member.getId(), referencedComponentId);
+								}
+							} else {
+								logger.error("Association ReferenceSetMember {} references unexpected component type {}", member.getId(), referencedComponentId);
+							}
+							break;
+					}
+				});
+			}
+		}
+		if (timer != null) timer.checkpoint("get inactivation refset " + getFetchCount(componentIds.size()));
 	}
 
 	private void joinLangRefsetMembers(BranchCriteria branchCriteria, Set<String> allConceptIds, Map<String, Description> descriptionIdMap) {
@@ -347,9 +460,6 @@ public class DescriptionService extends ComponentService {
 					Description description = descriptionIdMap.get(langRefsetMember.getReferencedComponentId());
 					if (description != null) {
 						description.addLanguageRefsetMember(langRefsetMember);
-					} else {
-						logger.error("Description {} for lang refset member {} not found on branch {}!",
-								langRefsetMember.getReferencedComponentId(), langRefsetMember.getMemberId(), branchCriteria.toString().replace("\n", ""));
 					}
 				});
 			}
@@ -369,7 +479,7 @@ public class DescriptionService extends ComponentService {
 	}
 
 	private Collection<Long> findDescriptionConceptIds(BoolQueryBuilder descriptionCriteria, Boolean conceptActive, String conceptRefset,
-			boolean groupByConcept, Collection<Long> descriptionIdsGroupedByConcept, BranchCriteria branchCriteria) {
+			boolean groupByConcept, Collection<Long> descriptionIdsGroupedByConcept, BranchCriteria branchCriteria) throws TooCostlyException {
 
 		Collection<Long> conceptIds;
 		SearchResultMapper mapper;
@@ -383,13 +493,19 @@ public class DescriptionService extends ComponentService {
 			conceptIds = new LongArrayList();
 			mapper = new DescriptionToConceptIdMapper(conceptIds);
 		}
+		NativeSearchQueryBuilder searchQueryBuilder = new NativeSearchQueryBuilder()
+				.withQuery(descriptionCriteria)
+				.withStoredFields(Description.Fields.DESCRIPTION_ID, Description.Fields.CONCEPT_ID);
+
+		long totalElements = elasticsearchTemplate.queryForPage(searchQueryBuilder.withPageable(PAGE_OF_ONE).build(), Description.class).getTotalElements();
+		if (totalElements > aggregationMaxProcessableResultsSize) {
+			throw new TooCostlyException(String.format("There are over %s results. Aggregating these results would be too costly.", aggregationMaxProcessableResultsSize));
+		}
+
+		NativeSearchQuery searchQuery = searchQueryBuilder.withPageable(LARGE_PAGE).build();
+		addTermSort(searchQuery);
 		try (CloseableIterator<Description> stream = elasticsearchTemplate.stream(
-				new NativeSearchQueryBuilder()
-						.withQuery(descriptionCriteria)
-						.withSort(SortBuilders.fieldSort("_doc"))
-						.withStoredFields(Description.Fields.DESCRIPTION_ID, Description.Fields.CONCEPT_ID)
-						.withPageable(LARGE_PAGE)
-						.build(), Description.class, mapper)) {
+				searchQuery, Description.class, mapper)) {
 			stream.forEachRemaining(hit -> {});
 		}
 
@@ -441,29 +557,30 @@ public class DescriptionService extends ComponentService {
 	}
 
 	void addTermClauses(String term, Collection<String> languageCodes, BoolQueryBuilder boolBuilder) {
-		addTermClauses(term, languageCodes, boolBuilder, null);
+		addTermClauses(term, languageCodes, null, boolBuilder, null);
 	}
 
-	private void addTermClauses(String term, Collection<String> languageCodes, BoolQueryBuilder boolBuilder, SearchMode searchMode) {
+	private void addTermClauses(String term, Collection<String> languageCodes, Collection<Long> descriptionTypes, BoolQueryBuilder boolBuilder, SearchMode searchMode) {
 		if (IdentifierService.isConceptId(term)) {
 			boolBuilder.must(termQuery(Description.Fields.CONCEPT_ID, term));
 		} else {
 			if (!Strings.isNullOrEmpty(term)) {
+				BoolQueryBuilder termFilter = new BoolQueryBuilder();
+				boolBuilder.filter(termFilter);
 				if (searchMode == SearchMode.REGEX) {
-					//https://www.elastic.co/guide/en/elasticsearch/reference/master/query-dsl-query-string-query.html#_regular_expressions
+					// https://www.elastic.co/guide/en/elasticsearch/reference/master/query-dsl-query-string-query.html#_regular_expressions
 					if (term.startsWith("^")) {
 						term = term.substring(1);
 					}
 					if (term.endsWith("$")) {
 						term = term.substring(0, term.length()-1);
 					}
-					boolBuilder.must(regexpQuery(Description.Fields.TERM, term));
+					termFilter.must(regexpQuery(Description.Fields.TERM, term));
 					// Must match the requested language
 					boolBuilder.must(termsQuery(Description.Fields.LANGUAGE_CODE, languageCodes));
 				} else {
 					// Must match at least one of the following 'should' clauses:
 					BoolQueryBuilder shouldClauses = boolQuery();
-
 					// All prefixes given. Simple Query String Query: https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-simple-query-string-query.html
 					// e.g. 'Clin Fin' converts to 'clin* fin*' and matches 'Clinical Finding'
 					// Put search term through character folding for each requested language
@@ -471,21 +588,117 @@ public class DescriptionService extends ComponentService {
 					for (String languageCode : languageCodes) {
 						Set<Character> charactersNotFoldedForLanguage = charactersNotFoldedSets.getOrDefault(languageCode, Collections.emptySet());
 						String foldedSearchTerm = DescriptionHelper.foldTerm(term, charactersNotFoldedForLanguage);
+						foldedSearchTerm = constructSearchTerm(analyze(foldedSearchTerm, new StandardAnalyzer(CharArraySet.EMPTY_SET)));
+						if (foldedSearchTerm.isEmpty()) {
+							continue;
+						}
 						shouldClauses.should(boolQuery()
 								.must(termQuery(Description.Fields.LANGUAGE_CODE, languageCode))
-								.filter(simpleQueryStringQuery((foldedSearchTerm.trim().replace(" ", "* ") + "*").replace("**", "*"))
+								.filter(simpleQueryStringQuery(constructSimpleQueryString(foldedSearchTerm))
 										.field(Description.Fields.TERM_FOLDED).defaultOperator(Operator.AND)));
 					}
 
-					boolBuilder.must(shouldClauses);
+					if (containingNonAlphanumeric(term)) {
+						String regexString = constructRegexQuery(term);
+						termFilter.must(regexpQuery(Description.Fields.TERM, regexString));
+					}
+					termFilter.must(shouldClauses);
 				}
 			}
 		}
+		if (descriptionTypes != null && !descriptionTypes.isEmpty()) {
+			boolBuilder.must(termsQuery(Description.Fields.TYPE_ID, descriptionTypes));
+		}
+	}
+
+	private List<String> analyze(String text, StandardAnalyzer analyzer) {
+		List<String> result = new ArrayList<>();
+		try {
+			TokenStream tokenStream = analyzer.tokenStream("contents", text);
+			CharTermAttribute attr = tokenStream.addAttribute(CharTermAttribute.class);
+			tokenStream.reset();
+			while (tokenStream.incrementToken()) {
+				result.add(attr.toString());
+			}
+		} catch (IOException e) {
+			logger.error("Failed to analyze text {}", text, e);
+		}
+		return result;
+	}
+
+	private String constructSimpleQueryString(String searchTerm) {
+		return (searchTerm.trim().replace(" ", "* ") + "*").replace("**", "*");
+	}
+
+	private boolean containingNonAlphanumeric(String term) {
+		String[] words = term.split(" ", -1);
+		for (String word : words) {
+			if (!StringUtils.isAlphanumeric(word)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private String constructRegexQuery(String term) {
+		String[] words = term.split(" ", -1);
+		StringBuilder regexBuilder = new StringBuilder();
+		regexBuilder.append(".*");
+		for (String word : words) {
+			if (StringUtils.isAlphanumeric(word)) {
+				if (!regexBuilder.toString().endsWith(".*")) {
+					regexBuilder.append(".*");
+				}
+				continue;
+			}
+			for (char c : word.toCharArray()) {
+				if (Character.isLetter(c)) {
+					regexBuilder.append("[" + Character.toLowerCase(c) + Character.toUpperCase(c) + "]");
+				} else if (Character.isDigit(c)){
+					regexBuilder.append(c);
+				} else {
+					regexBuilder.append("\\" + c);
+				}
+			}
+			regexBuilder.append(".*");
+		}
+		if (!regexBuilder.toString().endsWith(".*")) {
+			regexBuilder.append(".*");
+		}
+		return regexBuilder.toString();
+	}
+
+	private String constructSearchTerm(List<String> tokens) {
+		StringBuilder builder = new StringBuilder();
+		for (String token : tokens) {
+			builder.append(token);
+			builder.append(" ");
+		}
+		return builder.toString().trim();
 	}
 
 	static NativeSearchQuery addTermSort(NativeSearchQuery query) {
-		query.addSort(Sort.by("termLen"));
+		query.addSort(Sort.by(Description.Fields.TERM_LEN));
 		query.addSort(Sort.by("_score"));
 		return query;
+	}
+
+	private static class SemanticTagCacheEntry {
+
+		private final long branchHeadTime;
+		private final Map<String, Long> tagCounts;
+
+		SemanticTagCacheEntry(long branchHeadTime, Map<String, Long> tagCounts) {
+			this.branchHeadTime = branchHeadTime;
+			this.tagCounts = tagCounts;
+		}
+
+		public long getBranchHeadTime() {
+			return branchHeadTime;
+		}
+
+		public Map<String, Long> getTagCounts() {
+			return tagCounts;
+		}
 	}
 }

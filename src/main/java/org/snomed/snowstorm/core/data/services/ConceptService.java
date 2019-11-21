@@ -11,9 +11,11 @@ import io.kaicode.elasticvc.api.ComponentService;
 import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.elasticvc.domain.Branch;
 import io.kaicode.elasticvc.domain.Commit;
+import io.kaicode.elasticvc.domain.DomainEntity;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.search.sort.SortBuilders;
 import org.ihtsdo.sso.integration.SecurityUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,6 +93,9 @@ public class ConceptService extends ComponentService {
 	@Autowired
 	private TraceabilityLogService traceabilityLogService;
 
+	@Autowired
+	private ConceptAttributeSortHelper conceptAttributeSortHelper;
+
 	private final Cache<String, AsyncConceptChangeBatch> batchConceptChanges;
 
 	private Logger logger = LoggerFactory.getLogger(getClass());
@@ -121,6 +126,10 @@ public class ConceptService extends ComponentService {
 
 	public Collection<Concept> find(String path, Collection<?> ids, List<String> languageCodes) {
 		return doFind(ids, languageCodes, new BranchTimepoint(path), PageRequest.of(0, ids.size())).getContent();
+	}
+
+	public Page<Concept> find(List<Long> conceptIds, List<String> languageCodes, String path, PageRequest pageRequest) {
+		return doFind(conceptIds, languageCodes, new BranchTimepoint(path), pageRequest);
 	}
 
 	public boolean exists(String id, String path) {
@@ -162,11 +171,11 @@ public class ConceptService extends ComponentService {
 		return doFind(conceptIds, languageCodes, branchCriteria, pageRequest, true, true);
 	}
 
-	private BranchCriteria getBranchCriteria(BranchTimepoint branchTimepoint) {
+	protected BranchCriteria getBranchCriteria(BranchTimepoint branchTimepoint) {
 		if (branchTimepoint.isBranchCreationTimepoint()) {
 			return versionControlHelper.getBranchCriteriaAtBranchCreationTimepoint(branchTimepoint.getBranchPath());
 		} else if (branchTimepoint.isBranchBaseTimepoint()) {
-			return versionControlHelper.getBranchCriteriaAtBranchBaseTimepoint(branchTimepoint.getBranchPath());
+			return versionControlHelper.getBranchCriteriaForParentBranchAtBranchBaseTimepoint(branchTimepoint.getBranchPath());
 		} else if (branchTimepoint.getTimepoint() != null) {
 			return versionControlHelper.getBranchCriteriaAtTimepoint(branchTimepoint.getBranchPath(), branchTimepoint.getTimepoint());
 		} else {
@@ -245,10 +254,11 @@ public class ConceptService extends ComponentService {
 			}
 			concepts = new PageImpl<>(allConcepts, pageRequest, total);
 		} else {
-			queryBuilder
+			NativeSearchQueryBuilder conceptQueryBuilder = new NativeSearchQueryBuilder()
 					.withQuery(boolQuery().must(branchCriteria.getEntityBranchCriteria(Concept.class)))
+					.withSort(SortBuilders.fieldSort(Concept.Fields.CONCEPT_ID))// Needed to support searchAfter
 					.withPageable(pageRequest);
-			concepts = elasticsearchTemplate.queryForPage(queryBuilder.build(), Concept.class);
+			concepts = elasticsearchTemplate.queryForPage(conceptQueryBuilder.build(), Concept.class);
 		}
 		for (Concept concept : concepts) {
 			concept.setRequestedLanguages(languageCodes);
@@ -315,6 +325,10 @@ public class ConceptService extends ComponentService {
 		timer.checkpoint("get relationship def status " + getFetchCount(conceptMiniMap.size()));
 
 		descriptionService.joinDescriptions(branchCriteria, conceptIdMap, conceptMiniMap, timer, includeDescriptionInactivationInfo);
+
+		conceptAttributeSortHelper.sortAttributes(conceptIdMap.values());
+		timer.checkpoint("Sort attributes");
+
 		timer.finish();
 
 		return concepts;
@@ -451,6 +465,7 @@ public class ConceptService extends ComponentService {
 		joinComponentsToConcepts(persistedComponents, conceptMiniMap, languageCodes);
 		// Populate relationship descriptions
 		populateConceptMinis(versionControlHelper.getBranchCriteria(branch), conceptMiniMap, languageCodes);
+		conceptAttributeSortHelper.sortAttributes(persistedComponents.getPersistedConcepts());
 	}
 
 	private PersistedComponents doSave(Collection<Concept> concepts, Branch branch) throws ServiceException {
@@ -479,16 +494,35 @@ public class ConceptService extends ComponentService {
 
 	public void deleteConceptAndComponents(String conceptId, String path, boolean force) {
 		try (final Commit commit = branchService.openCommit(path, branchMetadataHelper.getBranchLockMetadata("Deleting concept " + conceptId))) {
-			deleteConceptsAndComponentsWithinCommit(Collections.singleton(conceptId), commit, force);
+			List<Concept> deletedConcepts = deleteConceptsAndComponentsWithinCommit(Collections.singleton(conceptId), commit, force);
+			if (traceabilityLogService.isEnabled()) {
+				if (!deletedConcepts.isEmpty()) {
+					Concept concept = deletedConcepts.get(0);
+					Set<ReferenceSetMember> members = new HashSet<>();
+					if (concept.getInactivationIndicatorMembers() != null) {
+						members.addAll(concept.getInactivationIndicatorMembers());
+					}
+					if (concept.getAssociationTargetMembers() != null) {
+						members.addAll(concept.getAssociationTargetMembers());
+					}
+					if (concept.getAllOwlAxiomMembers() != null) {
+						members.addAll(concept.getAllOwlAxiomMembers());
+					}
+					PersistedComponents persistedComponents = new PersistedComponents(deletedConcepts, concept.getDescriptions(), concept.getRelationships(), members);
+					traceabilityLogService.logActivity(SecurityUtil.getUsername(), commit, persistedComponents);
+				}
+			}
+			commit.markSuccessful();
 		}
 	}
 
-	public void deleteConceptsAndComponentsWithinCommit(Collection<String> conceptIds, Commit commit, boolean force) {
+	public List<Concept> deleteConceptsAndComponentsWithinCommit(Collection<String> conceptIds, Commit commit, boolean force) {
 		if (conceptIds.isEmpty()) {
-			return;
+			return Collections.emptyList();
 		}
 
 		String path = commit.getBranch().getPath();
+		List<Concept> concepts = new ArrayList<>();
 		for (String conceptId : conceptIds) {
 			final Concept concept = find(conceptId, DEFAULT_LANGUAGE_CODES, path);
 			if (concept == null) {
@@ -498,7 +532,9 @@ public class ConceptService extends ComponentService {
 				throw new IllegalStateException("Released concept will not be deleted.");
 			}
 			conceptUpdateHelper.doDeleteConcept(path, commit, concept);
+			concepts.add(concept);
 		}
+		return concepts;
 	}
 
 	private void joinComponentsToConcepts(PersistedComponents persistedComponents, Map<String, ConceptMini> conceptMiniMap, List<String> languageCodes) {
@@ -539,7 +575,7 @@ public class ConceptService extends ComponentService {
 				.forEach(member -> joinAxiom(member, conceptMap, conceptMiniMap, languageCodes));
 	}
 
-	<T extends SnomedComponent> void doSaveBatchComponents(List<T> componentsToSave, Class<T> componentType, Commit commit) {
+	<T extends DomainEntity> void doSaveBatchComponents(List<T> componentsToSave, Class<T> componentType, Commit commit) {
 		conceptUpdateHelper.doSaveBatchComponents(componentsToSave, componentType, commit);
 	}
 

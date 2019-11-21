@@ -1,5 +1,10 @@
 package org.snomed.snowstorm.core.data.services;
 
+import io.kaicode.elasticvc.api.BranchCriteria;
+import io.kaicode.elasticvc.api.BranchService;
+import io.kaicode.elasticvc.api.PathUtil;
+import io.kaicode.elasticvc.api.VersionControlHelper;
+import io.kaicode.elasticvc.domain.Branch;
 import org.elasticsearch.action.update.UpdateRequest;
 import org.elasticsearch.search.sort.SortBuilders;
 import org.slf4j.Logger;
@@ -32,6 +37,18 @@ public class AdminOperationsService {
 
 	@Autowired
 	private ElasticsearchOperations elasticsearchTemplate;
+
+	@Autowired
+	private VersionControlHelper versionControlHelper;
+
+	@Autowired
+	private BranchMergeService branchMergeService;
+
+	@Autowired
+	private BranchService branchService;
+
+	@Autowired
+	private DomainEntityConfiguration domainEntityConfiguration;
 
 	private Logger logger = LoggerFactory.getLogger(getClass());
 
@@ -92,5 +109,29 @@ public class AdminOperationsService {
 		}
 		logger.info("Completed reindexing of description documents with language code '{}'. Of the {} documents found {} were updated due to a character folding change.",
 				languageCode, descriptionCount.get(), descriptionUpdateCount.get());
+	}
+
+	public Map<Class, Set<String>> findAndEndDonatedContent(String branch) {
+		if (PathUtil.isRoot(branch)) {
+			throw new IllegalArgumentException("Donated content should be ended on extension branch, not MAIN.");
+		}
+
+		logger.info("Finding and fixing donated content on {}.", branch);
+
+		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
+
+		Map<Class, Set<String>> fixesApplied = new HashMap<>();
+		branchMergeService.findAndEndDonatedComponentsOfAllTypes(branch, branchCriteria, fixesApplied);
+
+		logger.info("Completed donated content fixing on {}.", branch);
+		return fixesApplied;
+	}
+
+	public void rollbackCommit(String branchPath, long timepoint) {
+		Branch branchVersion = branchService.findAtTimepointOrThrow(branchPath, new Date(timepoint));
+		if (branchVersion.getEnd() != null) {
+			throw new IllegalStateException(String.format("Branch %s at timepoint %s is already ended, it's not the latest commit.", branchPath, timepoint));
+		}
+		branchService.rollbackCompletedCommit(branchVersion, new ArrayList<>(domainEntityConfiguration.getAllDomainEntityTypes()));
 	}
 }

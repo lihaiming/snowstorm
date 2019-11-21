@@ -7,10 +7,7 @@ import org.snomed.snowstorm.core.data.domain.CodeSystemVersion;
 import org.snomed.snowstorm.core.data.domain.fieldpermissions.CodeSystemCreate;
 import org.snomed.snowstorm.core.data.services.CodeSystemService;
 import org.snomed.snowstorm.core.data.services.ServiceException;
-import org.snomed.snowstorm.rest.pojo.CodeSystemMigrationRequest;
-import org.snomed.snowstorm.rest.pojo.CodeSystemUpdateRequest;
-import org.snomed.snowstorm.rest.pojo.CreateCodeSystemVersionRequest;
-import org.snomed.snowstorm.rest.pojo.ItemsPage;
+import org.snomed.snowstorm.rest.pojo.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -26,8 +23,11 @@ public class CodeSystemController {
 	@ApiOperation(value = "Create a code system",
 			notes = "Required fields are shortName and branch. " +
 					"shortName should use format SNOMEDCT-XX where XX is the country code for national extensions. " +
+					"dependantVersion uses effectiveTime format and can be used if the new code system depends on an older version of the parent code system, " +
+					"otherwise the latest version will be selected automatically. " +
 					"defaultLanguageCode can be used to force the sort order of the languages listed under the codesystem, " +
-					"otherwise these are sorted by the number of active translated terms.")
+					"otherwise these are sorted by the number of active translated terms. " +
+					"defaultLanguageReferenceSet has no effect on the API but can be used by browsers to reflect extension preferences. ")
 	@RequestMapping(method = RequestMethod.POST)
 	@ResponseBody
 	public ResponseEntity<Void> createCodeSystem(@RequestBody CodeSystemCreate codeSystem) {
@@ -76,8 +76,21 @@ public class CodeSystemController {
 		return ControllerHelper.getCreatedResponse(versionId);
 	}
 
-	@ApiOperation(value = "Migrate code system to a different dependant version.",
-			notes = "An integrity check should be run after this operation to find content that needs fixing.")
+	@ApiOperation(value = "Upgrade code system to a different dependant version.",
+			notes = "This operation can be used to upgrade an extension. The extension must have been imported on a branch which is a direct child of MAIN. " +
+					"For example: MAIN/SNOMEDCT-BE. " +
+					"newDependantVersion uses the same format as the effectiveTime RF2 field, for example 20190731. " +
+					"An integrity check should be run after this operation to find content that needs fixing. ")
+	@RequestMapping(value = "/{shortName}/upgrade", method = RequestMethod.POST)
+	@ResponseBody
+	public void upgradeCodeSystem(@PathVariable String shortName, @RequestBody CodeSystemUpgradeRequest request) {
+		codeSystemService.upgrade(shortName, request.getNewDependantVersion());
+	}
+
+	@ApiOperation(value = "DEPRECATED - Migrate code system to a different dependant version.",
+			notes = "DEPRECATED in favour of upgrade operation. " +
+					"This operation is required when an extension exists under an International version branch, for example: MAIN/2019-01-31/SNOMEDCT-BE. " +
+					"An integrity check should be run after this operation to find content that needs fixing.")
 	@RequestMapping(value = "/{shortName}/migrate", method = RequestMethod.POST)
 	@ResponseBody
 	public void migrateCodeSystem(@PathVariable String shortName, @RequestBody CodeSystemMigrationRequest request) throws ServiceException {

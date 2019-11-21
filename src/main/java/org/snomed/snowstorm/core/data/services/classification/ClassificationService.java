@@ -7,6 +7,8 @@ import io.kaicode.elasticvc.domain.Commit;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.UncategorizedExecutionException;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.search.sort.FieldSortBuilder;
 import org.elasticsearch.search.sort.SortBuilders;
@@ -50,6 +52,7 @@ import org.springframework.web.client.RestClientException;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.*;
+import java.text.NumberFormat;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -114,7 +117,17 @@ public class ClassificationService {
 	}
 
 	@PostConstruct
-	private void init() {
+	private void init() throws ServiceException {
+
+		try {
+			if (!elasticsearchOperations.indexExists(Concept.class)) {
+				throw new StartupException("Elasticsearch Concept index does not exist.");
+			}
+		} catch (UncategorizedExecutionException e) {
+			throw new StartupException("Not able to connect to Elasticsearch. " +
+					"Check that Elasticsearch is running and that you have the right version installed.", e);
+		}
+
 		NativeSearchQueryBuilder queryBuilder = new NativeSearchQueryBuilder()
 				.withQuery(termsQuery(Classification.Fields.STATUS, ClassificationStatus.SCHEDULED.name(), ClassificationStatus.RUNNING.name()))
 				.withPageable(PAGE_FIRST_1K);
@@ -184,6 +197,7 @@ public class ClassificationService {
 								classification.setStatus(latestStatus);
 								classification.setCompletionDate(new Date());
 								classificationRepository.save(classification);
+								logger.info("Classification {} {}.", classification.getId(), classification.getStatus());
 							}
 							if (latestStatus != ClassificationStatus.SCHEDULED && latestStatus != ClassificationStatus.RUNNING) {
 								synchronized (classificationsInProgress) {
@@ -396,7 +410,10 @@ public class ClassificationService {
 					}
 					break;
 				case REDUNDANT:
-					concept.getRelationships().remove(new Relationship(relationshipChange.getRelationshipId()));
+					int before = concept.getRelationships().size();
+					if (!concept.getRelationships().remove(new Relationship(relationshipChange.getRelationshipId())) || concept.getRelationships().size() == before) {
+						throw new ServiceException(String.format("Failed to remove relationship %s from concept %s.", relationshipChange.getRelationshipId(), concept.getConceptId()));
+					}
 					break;
 			}
 			if (copyDescriptions && relationship != null) {
@@ -500,71 +517,93 @@ public class ClassificationService {
 		List<RelationshipChange> relationshipChanges = new ArrayList<>();
 		int recordSortNumber = 0;
 		String line;
+		long activeRows = 0;
+		boolean active;
 		while ((line = reader.readLine()) != null) {
 			String[] values = line.split("\\t");
 			// Header id	effectiveTime	active	moduleId	sourceId	destinationId	relationshipGroup	typeId	characteristicTypeId	modifierId
+			active = "1".equals(values[RelationshipFieldIndexes.active]);
 			relationshipChanges.add(new RelationshipChange(
 					recordSortNumber++,
 					classificationId,
 					values[RelationshipFieldIndexes.id],
-					"1".equals(values[RelationshipFieldIndexes.active]),
+					active,
 					values[RelationshipFieldIndexes.sourceId],
 					values[RelationshipFieldIndexes.destinationId],
 					Integer.parseInt(values[RelationshipFieldIndexes.relationshipGroup]),
 					values[RelationshipFieldIndexes.typeId],
 					values[RelationshipFieldIndexes.modifierId],
 					false));
+			if (active) {
+				activeRows++;
+			}
 		}
 
 		// - Mark inferred not previously stated changes -
 		// Build query to find concepts in the stated semantic index which do not contain the inferred parents or attributes
-		Map<Long, List<RelationshipChange>> activeConceptChanges = new HashMap<>();
-		BoolQueryBuilder allConceptsQuery = boolQuery();
-		for (RelationshipChange relationshipChange : relationshipChanges) {
-			if (relationshipChange.isActive()) {
-				Long sourceId = parseLong(relationshipChange.getSourceId());
-				BoolQueryBuilder conceptQuery = boolQuery()
-						.must(termQuery(QueryConcept.Fields.CONCEPT_ID, sourceId));
-				if (relationshipChange.getTypeId().equals(Concepts.ISA)) {
-					conceptQuery.mustNot(termQuery(QueryConcept.Fields.PARENTS, relationshipChange.getDestinationId()));
-				} else {
-					conceptQuery.mustNot(termQuery(QueryConcept.Fields.ATTR + "." + relationshipChange.getTypeId(), relationshipChange.getDestinationId()));
-				}
-				allConceptsQuery.should(conceptQuery);
-				activeConceptChanges.computeIfAbsent(sourceId, id -> new ArrayList<>()).add(relationshipChange);
-			}
+		NumberFormat numberFormat = NumberFormat.getIntegerInstance();
+		if (activeRows > 0) {
+			logger.info("Looking up 'inferred not previously stated' values for {} active inferred relationship changes for classification {}.",
+					numberFormat.format(activeRows), classificationId);
 		}
-		try (CloseableIterator<QueryConcept> semanticIndexConcepts = elasticsearchOperations.stream(
-				new NativeSearchQueryBuilder()
-						.withQuery(termQuery(QueryConcept.Fields.STATED, true))
-						.withFilter(allConceptsQuery)
-						.withPageable(LARGE_PAGE).build(),
-				QueryConcept.class)) {
+		long rowsProcessed = 0;
+		Map<Long, List<RelationshipChange>> activeConceptChanges = new HashMap<>();
+		for (List<RelationshipChange> relationshipChangePartition : Lists.partition(relationshipChanges, 900)) {
+			BoolQueryBuilder allConceptsQuery = boolQuery();
+			for (RelationshipChange relationshipChange : relationshipChangePartition) {
+				if (relationshipChange.isActive()) {
+					Long sourceId = parseLong(relationshipChange.getSourceId());
+					BoolQueryBuilder conceptQuery = boolQuery()
+							.must(termQuery(QueryConcept.Fields.CONCEPT_ID, sourceId));
+					if (relationshipChange.getTypeId().equals(Concepts.ISA)) {
+						conceptQuery.mustNot(termQuery(QueryConcept.Fields.PARENTS, relationshipChange.getDestinationId()));
+					} else {
+						conceptQuery.mustNot(termQuery(QueryConcept.Fields.ATTR + "." + relationshipChange.getTypeId(), relationshipChange.getDestinationId()));
+					}
+					allConceptsQuery.should(conceptQuery);
+					activeConceptChanges.computeIfAbsent(sourceId, id -> new ArrayList<>()).add(relationshipChange);
+					rowsProcessed++;
+					if (rowsProcessed % 1_000 == 0) {
+						logger.info("Processing row {} of {} for classification {}", numberFormat.format(rowsProcessed), numberFormat.format(activeRows), classificationId);
+					}
+				}
+			}
+			try (CloseableIterator<QueryConcept> semanticIndexConcepts = elasticsearchOperations.stream(
+					new NativeSearchQueryBuilder()
+							.withQuery(termQuery(QueryConcept.Fields.STATED, true))
+							.withFilter(allConceptsQuery)
+							.withPageable(LARGE_PAGE).build(),
+					QueryConcept.class)) {
 
-			semanticIndexConcepts.forEachRemaining(semanticIndexConcept -> {
-				// One or more inferred attributes or parents do not exist on this stated semanticIndexConcept
-				List<RelationshipChange> conceptChanges = activeConceptChanges.get(semanticIndexConcept.getConceptIdL());
-				if (conceptChanges != null) {
-					Map<String, Set<String>> conceptAttributes = semanticIndexConcept.getAttr();
-					for (RelationshipChange relationshipChange : conceptChanges) {
-						if (relationshipChange.getTypeId().equals(Concepts.ISA)) {
-							if (!semanticIndexConcept.getParents().contains(parseLong(relationshipChange.getDestinationId()))) {
-								relationshipChange.setInferredNotStated(true);
-							}
-						} else {
-							if (!conceptAttributes.getOrDefault(relationshipChange.getTypeId(), Collections.emptySet()).contains(relationshipChange.getDestinationId())) {
-								relationshipChange.setInferredNotStated(true);
+				semanticIndexConcepts.forEachRemaining(semanticIndexConcept -> {
+					// One or more inferred attributes or parents do not exist on this stated semanticIndexConcept
+					List<RelationshipChange> conceptChanges = activeConceptChanges.get(semanticIndexConcept.getConceptIdL());
+					if (conceptChanges != null) {
+						Map<String, Set<String>> conceptAttributes = semanticIndexConcept.getAttr();
+						for (RelationshipChange relationshipChange : conceptChanges) {
+							if (relationshipChange.getTypeId().equals(Concepts.ISA)) {
+								if (!semanticIndexConcept.getParents().contains(parseLong(relationshipChange.getDestinationId()))) {
+									relationshipChange.setInferredNotStated(true);
+								}
+							} else {
+								if (!conceptAttributes.getOrDefault(relationshipChange.getTypeId(), Collections.emptySet()).contains(relationshipChange.getDestinationId())) {
+									relationshipChange.setInferredNotStated(true);
+								}
 							}
 						}
 					}
-				}
-			});
+				});
+			}
 		}
 
 		if (!relationshipChanges.isEmpty()) {
-			logger.info("Saving {} classification relationship changes", relationshipChanges.size());
-			List<List<RelationshipChange>> partition = Lists.partition(relationshipChanges, 10_000);
+			logger.info("Saving {} classification relationship changes total.", numberFormat.format(relationshipChanges.size()));
+			int chunkSize = 10_000;
+			List<List<RelationshipChange>> partition = Lists.partition(relationshipChanges, chunkSize);
 			for (List<RelationshipChange> changes : partition) {
+				if (relationshipChanges.size() > chunkSize) {
+					logger.info("Saving batch of {} classification relationship changes.", numberFormat.format(changes.size()));
+				}
 				relationshipChangeRepository.saveAll(changes);
 			}
 		}
@@ -594,5 +633,11 @@ public class ClassificationService {
 				equivalentConceptsRepository.saveAll(equivalentConcepts);
 			}
 		}
+	}
+
+	public void deleteAll() {
+		classificationRepository.deleteAll();
+		relationshipChangeRepository.deleteAll();
+		equivalentConceptsRepository.deleteAll();
 	}
 }

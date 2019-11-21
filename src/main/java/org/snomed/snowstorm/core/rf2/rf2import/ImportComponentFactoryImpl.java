@@ -19,6 +19,8 @@ import org.springframework.data.util.CloseableIterator;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -47,13 +49,14 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 	private List<PersistBuffer> persistBuffers;
 	private List<PersistBuffer> coreComponentPersistBuffers;
 	private MaxEffectiveTimeCollector maxEffectiveTimeCollector;
+	private Map<String, AtomicLong> componentTypeSkippedMap = new HashMap<>();
 
 	// A small number of stated relationships also appear in the inferred file. These should not be persisted when importing a snapshot.
 	Set<Long> statedRelationshipsToSkip = Sets.newHashSet(3187444026L, 3192499027L, 3574321020L);
 	boolean coreComponentsFlushed;
 
 	ImportComponentFactoryImpl(ConceptUpdateHelper conceptUpdateHelper, ReferenceSetMemberService memberService, BranchService branchService,
-			BranchMetadataHelper branchMetadataHelper, String path, Integer patchReleaseVersion) {
+			BranchMetadataHelper branchMetadataHelper, String path, Integer patchReleaseVersion, boolean copyReleaseFields, boolean clearEffectiveTimes) {
 
 		this.branchService = branchService;
 		this.branchMetadataHelper = branchMetadataHelper;
@@ -67,7 +70,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 		conceptPersistBuffer = new PersistBuffer<Concept>() {
 			@Override
 			public void persistCollection(Collection<Concept> entities) {
-				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Concept.class);
+				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Concept.class, copyReleaseFields, clearEffectiveTimes);
 				if (!entities.isEmpty()) {
 					conceptUpdateHelper.doSaveBatchConcepts(entities, commit);
 				}
@@ -78,7 +81,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 		descriptionPersistBuffer = new PersistBuffer<Description>() {
 			@Override
 			public void persistCollection(Collection<Description> entities) {
-				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Description.class);
+				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Description.class, copyReleaseFields, clearEffectiveTimes);
 				if (!entities.isEmpty()) {
 					conceptUpdateHelper.doSaveBatchDescriptions(entities, commit);
 				}
@@ -89,7 +92,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 		relationshipPersistBuffer = new PersistBuffer<Relationship>() {
 			@Override
 			public void persistCollection(Collection<Relationship> entities) {
-				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Relationship.class);
+				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, Relationship.class, copyReleaseFields, clearEffectiveTimes);
 				if (!entities.isEmpty()) {
 					conceptUpdateHelper.doSaveBatchRelationships(entities, commit);
 				}
@@ -108,7 +111,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 						}
 					}
 				}
-				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, ReferenceSetMember.class);
+				processEntities(entities, patchReleaseVersion, elasticsearchTemplate, ReferenceSetMember.class, copyReleaseFields, clearEffectiveTimes);
 				if (!entities.isEmpty()) {
 					memberService.doSaveBatchMembers(entities, commit);
 				}
@@ -117,14 +120,22 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 	}
 
 	/*
-		- Mark as changed for version control
-		- collect max effectiveTime
-		- remove c
+		- Mark as changed for version control.
+		- Remove if earlier or equal effectiveTime to existing.
+		- Copy release fields from existing.
 	 */
-	private <T extends SnomedComponent> void processEntities(Collection<T> components, Integer patchReleaseVersion, ElasticsearchOperations elasticsearchTemplate, Class<T> componentClass) {
+	private <T extends SnomedComponent> void processEntities(Collection<T> components, Integer patchReleaseVersion, ElasticsearchOperations elasticsearchTemplate,
+			Class<T> componentClass, boolean copyReleaseFields, boolean clearEffectiveTimes) {
+
 		Map<Integer, List<T>> effectiveDateMap = new HashMap<>();
 		components.forEach(component -> {
 			component.setChanged(true);
+			if (clearEffectiveTimes) {
+				component.setEffectiveTimeI(null);
+				component.setReleased(false);
+				component.setReleaseHash(null);
+				component.setReleasedEffectiveTime(null);
+			}
 			Integer effectiveTimeI = component.getEffectiveTimeI();
 			if (effectiveTimeI != null) {
 				effectiveDateMap.computeIfAbsent(effectiveTimeI, i -> new ArrayList<>()).add(component);
@@ -148,14 +159,32 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 					.withPageable(LARGE_PAGE)
 					.build(), componentClass)) {
 				componentsWithSameOrLaterEffectiveTime.forEachRemaining(component -> {
+					// Skip component import
 					components.remove(component);// Compared by id only
 					alreadyExistingComponentCount.incrementAndGet();
 				});
 			}
-			if (alreadyExistingComponentCount.get() > 0) {
-				// Remove ineffective components
-				logger.info("{} {} components in the RF2 import with effectiveTime {} will not be imported because components already exist " +
-						"with the same identifier at the same or later effectiveTime.", alreadyExistingComponentCount.get(), componentClass.getSimpleName(), effectiveTime);
+			componentTypeSkippedMap.computeIfAbsent(componentClass.getSimpleName(), key -> new AtomicLong()).addAndGet(alreadyExistingComponentCount.get());
+		}
+		if (copyReleaseFields) {
+			Map<String, T> idToUnreleasedComponentMap = components.stream().filter(component -> component.getEffectiveTime() == null).collect(Collectors.toMap(T::getId, Function.identity()));
+			if (!idToUnreleasedComponentMap.isEmpty()) {
+				String idField = idToUnreleasedComponentMap.values().iterator().next().getIdField();
+				try (CloseableIterator<T> stream = elasticsearchTemplate.stream(new NativeSearchQueryBuilder()
+						.withQuery(boolQuery()
+								.must(branchCriteriaBeforeOpenCommit.getEntityBranchCriteria(componentClass))
+								.must(termQuery(SnomedComponent.Fields.RELEASED, true))
+								.filter(termsQuery(idField, idToUnreleasedComponentMap.keySet()))
+						)
+						.withPageable(LARGE_PAGE)
+						.build(), componentClass)) {
+					stream.forEachRemaining(component -> {
+						T t = idToUnreleasedComponentMap.get(component.getId());
+						// noinspection unchecked
+						t.copyReleaseDetails(component);
+						t.updateEffectiveTime();
+					});
+				}
 			}
 		}
 	}
@@ -177,6 +206,11 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 	}
 
 	void completeImportCommit() {
+		if (!componentTypeSkippedMap.isEmpty()) {
+			for (String type : componentTypeSkippedMap.keySet()) {
+				logger.info("{} components of type {} were not imported from RF2 because a newer version was found.", componentTypeSkippedMap.get(type).get(), type);
+			}
+		}
 		persistBuffers.forEach(PersistBuffer::flush);
 		commit.markSuccessful();
 		commit.close();
@@ -199,7 +233,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 		Integer effectiveTimeI = getEffectiveTimeI(effectiveTime);
 		final Relationship relationship = new Relationship(id, effectiveTimeI, isActive(active), moduleId, sourceId,
 				destinationId, Integer.parseInt(relationshipGroup), typeId, characteristicTypeId, modifierId);
-		if (effectiveTime != null) {
+		if (effectiveTimeI != null) {
 			relationship.release(effectiveTimeI);
 		}
 
@@ -234,7 +268,7 @@ public class ImportComponentFactoryImpl extends ImpotentComponentFactory {
 		for (int i = MEMBER_ADDITIONAL_FIELD_OFFSET; i < fieldNames.length; i++) {
 			member.setAdditionalField(fieldNames[i], otherValues[i - MEMBER_ADDITIONAL_FIELD_OFFSET]);
 		}
-		if (effectiveTime != null) {
+		if (effectiveTimeI != null) {
 			member.release(effectiveTimeI);
 		}
 		memberPersistBuffer.save(member);

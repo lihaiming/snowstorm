@@ -1,12 +1,15 @@
 package org.snomed.snowstorm.rest;
 
+import ch.qos.logback.classic.Level;
 import com.fasterxml.jackson.annotation.JsonView;
 import io.kaicode.elasticvc.api.BranchCriteria;
 import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.rest.util.branchpathrewrite.BranchPathUriUtil;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import org.elasticsearch.common.Strings;
 import org.snomed.snowstorm.core.data.domain.Concept;
 import org.snomed.snowstorm.core.data.domain.ConceptMini;
 import org.snomed.snowstorm.core.data.domain.ConceptView;
@@ -17,10 +20,16 @@ import org.snomed.snowstorm.core.data.services.pojo.AsyncConceptChangeBatch;
 import org.snomed.snowstorm.core.data.services.pojo.MapPage;
 import org.snomed.snowstorm.core.data.services.pojo.ResultMapPage;
 import org.snomed.snowstorm.core.pojo.BranchTimepoint;
+import org.snomed.snowstorm.core.util.PageHelper;
+import org.snomed.snowstorm.core.util.TimerUtil;
+import org.snomed.snowstorm.rest.converter.SearchAfterHelper;
 import org.snomed.snowstorm.rest.pojo.*;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.elasticsearch.core.SearchAfterPage;
+import org.springframework.data.elasticsearch.core.SearchAfterPageRequest;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.util.Assert;
@@ -56,6 +65,9 @@ public class ConceptController {
 
 	@Autowired
 	private VersionControlHelper versionControlHelper;
+
+	@Value("${snowstorm.rest-api.allowUnlimitedConceptPagination:false}")
+	private boolean allowUnlimitedConceptPagination;
 
 	@RequestMapping(value = "/{branch}/concepts", method = RequestMethod.GET, produces = {"application/json", "text/csv"})
 	@ResponseBody
@@ -146,18 +158,37 @@ public class ConceptController {
 				acceptLanguageHeader);
 	}
 
+	@ApiOperation(value = "Load concepts in the browser format.",
+			notes = "When enabled 'searchAfter' can be used for unlimited pagination. " +
+					"Load the first page then take the 'searchAfter' value from the response and use that " +
+					"as a parameter in the next page request instead of 'number'.")
 	@RequestMapping(value = "/browser/{branch}/concepts", method = RequestMethod.GET)
 	@ResponseBody
 	@JsonView(value = View.Component.class)
-	public Page<? extends ConceptView> getBrowserConcepts(
+	public ItemsPage<Concept> getBrowserConcepts(
 			@PathVariable String branch,
+			@RequestParam(required = false) List<Long> conceptIds,
 			@RequestParam(defaultValue = "0") int number,
 			@RequestParam(defaultValue = "100") int size,
+			@RequestParam(required = false) String searchAfter,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
 
-		PageRequest pageRequest = PageRequest.of(number, size);
-		ControllerHelper.validatePageSize(pageRequest.getOffset(), pageRequest.getPageSize());
-		return conceptService.findAll(BranchPathUriUtil.decodePath(branch), ControllerHelper.getLanguageCodes(acceptLanguageHeader), pageRequest);
+		PageRequest pageRequest;
+		Integer conceptIdsSize = conceptIds != null ? conceptIds.size() : null;
+		if (!Strings.isNullOrEmpty(searchAfter)) {
+			if (!allowUnlimitedConceptPagination) {
+				throw new IllegalArgumentException("Unlimited pagination of the full concept representation is disabled in this deployment.");
+			}
+			pageRequest = SearchAfterPageRequest.of(SearchAfterHelper.fromSearchAfterToken(searchAfter), size);
+		} else {
+			pageRequest = PageRequest.of(number, size);
+			ControllerHelper.validatePageSize(pageRequest.getOffset(), pageRequest.getPageSize());
+			conceptIds = PageHelper.subList(conceptIds, number, size);
+		}
+
+		Page<Concept> page = conceptService.find(conceptIds, ControllerHelper.getLanguageCodes(acceptLanguageHeader), BranchPathUriUtil.decodePath(branch), pageRequest);
+		SearchAfterPage<Concept> concepts = PageHelper.toSearchAfterPage(page, concept -> SearchAfterHelper.convertToTokenAndBack(new Object[]{concept.getId()}), conceptIdsSize);
+		return new ItemsPage<>(concepts);
 	}
 
 	@RequestMapping(value = "/browser/{branch}/concepts/bulk-load", method = RequestMethod.POST)
@@ -181,9 +212,17 @@ public class ConceptController {
 	public ConceptView findBrowserConcept(
 			@PathVariable String branch,
 			@PathVariable String conceptId,
+			@ApiParam("If this parameter is set a descendantCount will be included in the response using stated/inferred as requested.")
+			@RequestParam(required = false) Relationship.CharacteristicType descendantCountForm,
 			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
 
-		return ControllerHelper.throwIfNotFound("Concept", conceptService.find(conceptId, ControllerHelper.getLanguageCodes(acceptLanguageHeader), parseBranchTimepoint(branch)));
+		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
+		BranchTimepoint branchTimepoint = parseBranchTimepoint(branch);
+		Concept concept = conceptService.find(conceptId, languageCodes, branchTimepoint);
+		if (descendantCountForm != null) {
+			queryService.joinDescendantCount(concept, descendantCountForm, languageCodes, branchTimepoint);
+		}
+		return ControllerHelper.throwIfNotFound("Concept", concept);
 	}
 
 	@ResponseBody
@@ -311,17 +350,29 @@ public class ConceptController {
 	public Collection<ConceptMini> findConceptChildren(@PathVariable String branch,
 			@PathVariable String conceptId,
 			@RequestParam(defaultValue = "inferred") Relationship.CharacteristicType form,
-			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
+			@RequestParam(required = false, defaultValue = "false") Boolean includeDescendantCount,
+			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) throws ServiceException {
 
 		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
 		String branchPath = BranchPathUriUtil.decodePath(branch);
 
+		TimerUtil timer = new TimerUtil("Child listing: " + conceptId, Level.INFO, 5);
+
 		QueryService.ConceptQueryBuilder conceptQuery = queryService.createQueryBuilder(form)
 				.ecl("<!" + conceptId)
 				.languageCodes(languageCodes);
-		Page<ConceptMini> children = queryService.search(conceptQuery, branchPath, LARGE_PAGE);
-		queryService.joinIsLeafFlag(children.getContent(), branchPath, form);
-		return children.getContent();
+		List<ConceptMini> children = queryService.search(conceptQuery, branchPath, LARGE_PAGE).getContent();
+		timer.checkpoint("Find children");
+
+		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branchPath);
+		if (!includeDescendantCount) {
+			queryService.joinIsLeafFlag(children, form, branchCriteria);
+			timer.checkpoint("Join leaf flag");
+		} else {
+			queryService.joinDescendantCountAndLeafFlag(children, form, branchPath, branchCriteria);
+			timer.checkpoint("Join descendant count and leaf flag");
+		}
+		return children;
 	}
 
 	@ResponseBody
@@ -330,14 +381,19 @@ public class ConceptController {
 	public Collection<ConceptMini> findConceptParents(@PathVariable String branch,
 			@PathVariable String conceptId,
 			@RequestParam(defaultValue = "inferred") Relationship.CharacteristicType form,
-			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) {
+			@RequestParam(required = false, defaultValue = "false") Boolean includeDescendantCount,
+			@RequestHeader(value = "Accept-Language", defaultValue = ControllerHelper.DEFAULT_ACCEPT_LANG_HEADER) String acceptLanguageHeader) throws ServiceException {
 
 		branch = BranchPathUriUtil.decodePath(branch);
 		List<String> languageCodes = ControllerHelper.getLanguageCodes(acceptLanguageHeader);
 
 		BranchCriteria branchCriteria = versionControlHelper.getBranchCriteria(branch);
 		Set<Long> parentIds = queryService.findParentIds(branchCriteria, form == Relationship.CharacteristicType.stated, conceptId);
-		return conceptService.findConceptMinis(branchCriteria, parentIds, languageCodes).getResultsMap().values();
+		Collection<ConceptMini> parents = conceptService.findConceptMinis(branchCriteria, parentIds, languageCodes).getResultsMap().values();
+		if (includeDescendantCount) {
+			queryService.joinDescendantCountAndLeafFlag(parents, form, branch, branchCriteria);
+		}
+		return parents;
 	}
 
 	@ResponseBody

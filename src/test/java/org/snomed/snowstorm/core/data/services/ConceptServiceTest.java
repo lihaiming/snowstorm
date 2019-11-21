@@ -16,7 +16,9 @@ import org.slf4j.LoggerFactory;
 import org.snomed.snowstorm.AbstractTest;
 import org.snomed.snowstorm.TestConfig;
 import org.snomed.snowstorm.core.data.domain.*;
+import org.snomed.snowstorm.core.data.services.pojo.DescriptionCriteria;
 import org.snomed.snowstorm.core.data.services.pojo.MemberSearchRequest;
+import org.snomed.snowstorm.core.pojo.BranchTimepoint;
 import org.snomed.snowstorm.rest.View;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
@@ -56,6 +58,12 @@ public class ConceptServiceTest extends AbstractTest {
 	@Autowired
 	private QueryService queryService;
 
+	@Autowired
+	private BranchMergeService branchMergeService;
+
+	@Autowired
+	private CodeSystemService codeSystemService;
+
 	private ServiceTestUtil testUtil;
 
 	private final Logger logger = LoggerFactory.getLogger(getClass());
@@ -67,6 +75,7 @@ public class ConceptServiceTest extends AbstractTest {
 		objectMapper = new ObjectMapper();
 		DeserializationConfig deserializationConfig = objectMapper.getDeserializationConfig().without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 		objectMapper.setConfig(deserializationConfig);
+		codeSystemService.createCodeSystem(new CodeSystem("SNOMEDCT", "MAIN"));
 	}
 
 	@Test
@@ -203,6 +212,22 @@ public class ConceptServiceTest extends AbstractTest {
 		}
 		assertTrue(descriptionInactivationIndicatorMemberFound);
 		assertTrue(refersToMemberFound);
+	}
+
+	@Test
+	public void testCreateDeleteConcept() throws ServiceException {
+		String path = "MAIN";
+		conceptService.create(new Concept(ISA).setDefinitionStatusId(PRIMITIVE).addDescription(fsn("Is a (attribute)")), path);
+		conceptService.create(new Concept(SNOMEDCT_ROOT).setDefinitionStatusId(PRIMITIVE).addDescription(fsn("SNOMED CT Concept")), path);
+
+		String conceptId = "100001";
+		conceptService.create(new Concept(conceptId).addAxiom(new Relationship(ISA, SNOMEDCT_ROOT)), path);
+
+		assertEquals(1, referenceSetMemberService.findMembers(path, conceptId, ComponentService.LARGE_PAGE).getTotalElements());
+
+		conceptService.deleteConceptAndComponents(conceptId, path, false);
+
+		assertEquals(0, referenceSetMemberService.findMembers(path, conceptId, ComponentService.LARGE_PAGE).getTotalElements());
 	}
 
 	@Test
@@ -529,6 +554,17 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals("Description automatically has inactivation indicator", "CONCEPT_NON_CURRENT", description.getInactivationIndicator());
 
 		assertFalse("Relationship is inactive.", inactiveConcept.getRelationships().iterator().next().isActive());
+
+		CodeSystem snomedct = codeSystemService.find("SNOMEDCT");
+		codeSystemService.createVersion(snomedct, 20200131, "");
+
+		inactiveConcept = conceptService.find(inactiveConcept.getId(), path);
+		inactiveConcept.getInactivationIndicatorMembers().clear();
+		inactiveConcept.setInactivationIndicator("OUTDATED");
+		conceptService.update(inactiveConcept, path);
+
+		inactiveConcept = conceptService.find(inactiveConcept.getId(), path);
+		assertEquals("OUTDATED", inactiveConcept.getInactivationIndicator());
 	}
 
 	@Test
@@ -883,8 +919,47 @@ public class ConceptServiceTest extends AbstractTest {
 		assertEquals(1, someConcept.getRelationships().size());
 	}
 
-	private void printAllDescriptions(String path) {
-		final Page<Description> descriptions = descriptionService.findDescriptionsWithAggregations(path, null, ServiceTestUtil.PAGE_REQUEST);
+	@Test
+	public void testLoadConceptFromParentBranchUsingBaseTimepoint() throws ServiceException {
+		List<String> en = Lists.newArrayList("en");
+		String conceptId = "100001";
+
+		// Concept on MAIN with 1 description
+		Concept concept = testUtil.createConceptWithPathIdAndTerm("MAIN", conceptId, "Heart");
+
+		// Create branch A
+		branchService.create("MAIN/A");
+		assertEquals(1, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A")).getDescriptions().size());
+
+		// Add a second description on A
+		String branch = "MAIN/A";
+		conceptService.update(conceptService.find(conceptId, branch).addDescription(new Description("Another A")), branch);
+		assertEquals(2, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A")).getDescriptions().size());
+
+		// Concept using base version still has 1
+		assertEquals(1, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A", "^")).getDescriptions().size());
+
+		// Add a second description on MAIN
+		branch = "MAIN";
+		conceptService.update(conceptService.find(conceptId, branch).addDescription(new Description("Another MAIN")), branch);
+
+		// Concept using base version still has 1
+		assertEquals(1, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A", "^")).getDescriptions().size());
+
+		// Rebase A
+		branchMergeService.mergeBranchSync("MAIN", "MAIN/A", Collections.emptySet());
+
+		// A now has 3 descriptions
+		assertEquals(3, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A")).getDescriptions().size());
+
+		// Base version should now have 2 descriptions because the base of the branch moved when the rebase happened. It's the 2 descriptions on MAIN.
+		assertEquals(2, conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A", "^")).getDescriptions().size());
+		assertEquals("[Heart, Another MAIN]", conceptService.find(conceptId, en, new BranchTimepoint("MAIN/A", "^")).getDescriptions().stream()
+				.sorted(Comparator.comparing(Description::getTermLen)).map(Description::getTerm).collect(Collectors.toList()).toString());
+	}
+
+	private void printAllDescriptions(String path) throws TooCostlyException {
+		final Page<Description> descriptions = descriptionService.findDescriptionsWithAggregations(path, new DescriptionCriteria(), ServiceTestUtil.PAGE_REQUEST);
 		logger.info("Description on " + path);
 		for (Description description : descriptions) {
 			logger.info("{}", description);

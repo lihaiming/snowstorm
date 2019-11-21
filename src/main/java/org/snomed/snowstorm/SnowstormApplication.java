@@ -1,15 +1,18 @@
 package org.snomed.snowstorm;
 
-import com.github.xiaoymin.swaggerbootstrapui.annotations.EnableSwaggerBootstrapUI;
+import com.github.xiaoymin.knife4j.spring.annotations.EnableSwaggerBootstrapUi;
+import org.elasticsearch.common.util.concurrent.UncategorizedExecutionException;
 import org.ihtsdo.otf.snomedboot.ReleaseImportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.snomed.snowstorm.config.Config;
 import org.snomed.snowstorm.core.data.services.CodeSystemService;
 import org.snomed.snowstorm.core.data.services.ReferenceSetMemberService;
+import org.snomed.snowstorm.core.data.services.StartupException;
 import org.snomed.snowstorm.core.rf2.RF2Type;
 import org.snomed.snowstorm.core.rf2.rf2import.ImportService;
 import org.snomed.snowstorm.mrcm.MRCMService;
+import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -17,6 +20,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.jms.annotation.EnableJms;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import springfox.documentation.swagger2.annotations.EnableSwagger2;
 
 import java.io.File;
@@ -25,8 +29,9 @@ import java.io.IOException;
 import java.util.List;
 
 @EnableSwagger2
-@EnableSwaggerBootstrapUI
+@EnableSwaggerBootstrapUi
 @EnableJms
+@EnableScheduling
 public class SnowstormApplication extends Config implements ApplicationRunner {
 
 	private static final String DELETE_INDICES_FLAG = "delete-indices";
@@ -49,12 +54,22 @@ public class SnowstormApplication extends Config implements ApplicationRunner {
 	@Autowired
 	private ApplicationContext applicationContext;
 
-	private final Logger logger = LoggerFactory.getLogger(getClass());
+	private static final Logger logger = LoggerFactory.getLogger(SnowstormApplication.class);
 
 	public static void main(String[] args) {
 		System.setProperty("org.apache.tomcat.util.buf.UDecoder.ALLOW_ENCODED_SLASH", "true"); // Swagger encodes the slash in branch paths
 		System.setProperty("tomcat.util.http.parser.HttpParser.requestTargetAllow", "{}|"); // Allow these unencoded characters in URL (used in ECL)
-		SpringApplication.run(SnowstormApplication.class, args);
+		try {
+			SpringApplication.run(SnowstormApplication.class, args);
+		} catch (BeanCreationException e) {
+			if (e.getCause() instanceof StartupException) {
+				StartupException startupException = (StartupException) e.getCause();
+				logger.error("Error creating Snowstorm Spring context:", e);
+				System.out.println();
+				System.out.println();
+				logger.error("Snowstorm failed to start. Cause: {}", startupException.getMessage());
+			}
+		}
 	}
 
 	@Override
@@ -111,7 +126,7 @@ public class SnowstormApplication extends Config implements ApplicationRunner {
 
 	private void importEditionRF2FromDisk(String releasePath, RF2Type importType) {
 		// Import archive
-		String importId = importService.createJob(importType, "MAIN", true);
+		String importId = importService.createJob(importType, "MAIN", true, false);
 		try (FileInputStream releaseFileStream = new FileInputStream(releasePath)) {
 			importService.importArchive(importId, releaseFileStream);
 		} catch (IOException | ReleaseImportException e) {

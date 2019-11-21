@@ -2,6 +2,7 @@ package org.snomed.snowstorm.core.data.services;
 
 import io.kaicode.elasticvc.api.BranchCriteria;
 import io.kaicode.elasticvc.api.BranchService;
+import io.kaicode.elasticvc.api.PathUtil;
 import io.kaicode.elasticvc.api.VersionControlHelper;
 import io.kaicode.elasticvc.domain.Branch;
 import io.kaicode.rest.util.branchpathrewrite.BranchPathUriUtil;
@@ -62,7 +63,7 @@ public class CodeSystemService {
 	private ReleaseService releaseService;
 
 	@Autowired
-	private BranchMergeService mergeService;
+	private BranchMergeService branchMergeService;
 
 	@Autowired
 	private ConceptService conceptService;
@@ -95,6 +96,10 @@ public class CodeSystemService {
 		}
 	}
 
+	public boolean codeSystemExistsOnBranch(String branchPath) {
+		return findOneByBranchPath(branchPath) != null;
+	}
+
 	public synchronized void createCodeSystem(CodeSystem codeSystem) {
 		validatorService.validate(codeSystem);
 		if (repository.findById(codeSystem.getShortName()).isPresent()) {
@@ -104,7 +109,43 @@ public class CodeSystemService {
 		if (findByBranchPath(branchPath).isPresent()) {
 			throw new IllegalArgumentException("A code system already exists with this branch path.");
 		}
-		if (!branchService.exists(branchPath)) {
+		String parentPath = PathUtil.getParentPath(codeSystem.getBranchPath());
+		CodeSystem parentCodeSystem = null;
+		if (parentPath != null) {
+			Integer dependantVersion = codeSystem.getDependantVersion();
+			parentCodeSystem = findByBranchPath(parentPath).orElse(null);
+			if (dependantVersion != null) {
+				// Check dependant version exists on parent path
+				if (parentCodeSystem != null) {
+					if (findVersion(parentCodeSystem.getShortName(), dependantVersion) == null) {
+						throw new IllegalArgumentException(String.format("No code system version found matching dependantVersion '%s' on the parent branch path '%s'.", dependantVersion, parentPath));
+					}
+				} else {
+					throw new IllegalArgumentException(String.format("No code system found on the parent branch path '%s' so dependantVersion property is not required.", parentPath));
+				}
+			} else if (parentCodeSystem != null) {
+				// Find latest version on parent path
+				CodeSystemVersion latestVersion = findLatestVersion(parentCodeSystem.getShortName());
+				if (latestVersion != null) {
+					codeSystem.setDependantVersion(latestVersion.getEffectiveDate());
+				}
+			}
+		}
+		Integer dependantVersion = codeSystem.getDependantVersion();
+		boolean branchExists = branchService.exists(branchPath);
+		if (parentCodeSystem != null && dependantVersion != null) {
+			if (branchExists) {
+				throw new IllegalStateException(String.format("Unable to create code system branch with correct base timepoint because branch '%s' already exists!", branchPath));
+			}
+			// Create branch with base timepoint matching dependant version branch base timepoint
+			String releaseBranchPath = getReleaseBranchPath(parentCodeSystem.getBranchPath(), dependantVersion);
+			Branch dependantVersionBranch = branchService.findLatest(releaseBranchPath);
+			if (dependantVersionBranch == null) {
+				throw new IllegalStateException(String.format("Dependant version branch '%s' is missing.", releaseBranchPath));
+			}
+			branchService.createAtBaseTimepoint(branchPath, dependantVersionBranch.getBase());
+
+		} else if (!branchExists) {
 			logger.info("Creating Code System branch '{}'.", branchPath);
 			branchService.create(branchPath);
 		}
@@ -127,10 +168,9 @@ public class CodeSystemService {
 		if (effectiveDate == null || effectiveDate.toString().length() != 8) {
 			throw new IllegalArgumentException("Effective Date must have format yyyymmdd");
 		}
-		String effectiveDateString = effectiveDate.toString();
-		String version = effectiveDateString.substring(0, 4) + "-" + effectiveDateString.substring(4, 6) + "-" + effectiveDateString.substring(6, 8);
+		String version = getHyphenatedVersionString(effectiveDate);
 		String branchPath = codeSystem.getBranchPath();
-		String releaseBranchPath = branchPath + "/" + version;
+		String releaseBranchPath = getReleaseBranchPath(branchPath, effectiveDate);
 
 		CodeSystemVersion codeSystemVersion = versionRepository.findOneByShortNameAndEffectiveDate(codeSystem.getShortName(), effectiveDate);
 		if (codeSystemVersion != null) {
@@ -143,14 +183,23 @@ public class CodeSystemService {
 		releaseService.createVersion(effectiveDate, branchPath);
 
 		logger.info("Creating version branch content...");
-		branchService.create(releaseBranchPath);
+		Branch branch = branchService.create(releaseBranchPath);
 
 		logger.info("Persisting Code System Version...");
-		versionRepository.save(new CodeSystemVersion(codeSystem.getShortName(), new Date(), branchPath, effectiveDate, version, description));
+		versionRepository.save(new CodeSystemVersion(codeSystem.getShortName(), branch.getHead(), branchPath, effectiveDate, version, description));
 
 		logger.info("Versioning complete.");
 
 		return version;
+	}
+
+	private String getHyphenatedVersionString(Integer effectiveDate) {
+		String effectiveDateString = effectiveDate.toString();
+		return effectiveDateString.substring(0, 4) + "-" + effectiveDateString.substring(4, 6) + "-" + effectiveDateString.substring(6, 8);
+	}
+
+	private String getReleaseBranchPath(String branchPath, Integer effectiveDate) {
+		return branchPath + "/" + getHyphenatedVersionString(effectiveDate);
 	}
 
 	public synchronized void createVersionIfCodeSystemFoundOnPath(String branchPath, Integer releaseDate) {
@@ -298,6 +347,32 @@ public class CodeSystemService {
 		versionRepository.deleteAll();
 	}
 
+	public void upgrade(String shortName, Integer newDependantVersion) {
+		CodeSystem codeSystem = find(shortName);
+		if (codeSystem == null) {
+			throw new NotFoundException(String.format("Code System with short name '%s' does not exist.", shortName));
+		}
+		String branchPath = codeSystem.getBranchPath();
+		String parentPath = PathUtil.getParentPath(branchPath);
+		if (parentPath == null) {
+			throw new IllegalArgumentException("The root Code System can not be upgraded.");
+		}
+		CodeSystem parentCodeSystem = findOneByBranchPath(parentPath);
+		if (parentCodeSystem == null) {
+			throw new IllegalStateException(String.format("The Code System to be upgraded must be on a branch which is the direct child of another Code System. " +
+					"There is no Code System on parent branch '%s'.", parentPath));
+		}
+		CodeSystemVersion newParentVersion = findVersion(parentCodeSystem.getShortName(), newDependantVersion);
+		if (newParentVersion == null) {
+			throw new IllegalArgumentException(String.format("Parent Code System %s has no version with effectiveTime '%s'.", parentCodeSystem.getShortName(), newDependantVersion));
+		}
+
+		Branch newParentVersionBranch = branchService.findLatest(newParentVersion.getBranchPath());
+		Date newParentBaseTimepoint = newParentVersionBranch.getBase();
+		branchMergeService.rebaseToSpecificTimepointAndRemoveDuplicateContent(parentPath, newParentBaseTimepoint, branchPath, String.format("Upgrading extension to %s@%s.", parentPath, newParentVersion.getVersion()));
+	}
+
+	@Deprecated// Deprecated in favour of upgrade operation.
 	public void migrateDependantCodeSystemVersion(CodeSystem codeSystem, String dependantCodeSystem, Integer newDependantVersion, boolean copyMetadata) throws ServiceException {
 		try {
 			CodeSystemVersion newDependantCodeSystemVersion = versionRepository.findOneByShortNameAndEffectiveDate(dependantCodeSystem, newDependantVersion);
@@ -315,7 +390,7 @@ public class CodeSystemService {
 			String targetBranchPath = newDependantCodeSystemVersion.getParentBranchPath() + BranchPathUriUtil.SLASH
 					+ newDependantCodeSystemVersion.getVersion() + BranchPathUriUtil.SLASH + codeSystem.getShortName();
 
-			mergeService.copyBranchToNewParent(sourceBranchPath, targetBranchPath);
+			branchMergeService.copyBranchToNewParent(sourceBranchPath, targetBranchPath);
 
 			// Update code system branch path
 			codeSystem.setBranchPath(targetBranchPath);
@@ -333,10 +408,17 @@ public class CodeSystemService {
 		}
 	}
 
+	private CodeSystem findOneByBranchPath(String path) {
+		List<CodeSystem> results = elasticsearchOperations.queryForList(
+				new NativeSearchQueryBuilder().withQuery(termQuery(CodeSystem.Fields.BRANCH_PATH, path)).build(), CodeSystem.class);
+		return results.isEmpty() ? null : results.get(0);
+	}
+
 	public CodeSystem update(CodeSystem codeSystem, CodeSystemUpdateRequest updateRequest) {
 		modelMapper.map(updateRequest, codeSystem);
 		validatorService.validate(codeSystem);
 		repository.save(codeSystem);
+		contentInformationCache.remove(codeSystem.getBranchPath());
 		return codeSystem;
 	}
 }

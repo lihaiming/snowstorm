@@ -40,7 +40,7 @@ import java.util.concurrent.TimeUnit;
 				ElasticsearchDataAutoConfiguration.class})
 public class TestConfig extends Config {
 
-	private static final String ELASTIC_SEARCH_VERSION = "6.5.4";
+	private static final String ELASTIC_SEARCH_VERSION = "6.4.0";
 	public static final String DEFAULT_LANGUAGE_CODE = "en";
 	public static final List<String> DEFAULT_LANGUAGE_CODES = Collections.singletonList(DEFAULT_LANGUAGE_CODE);
 

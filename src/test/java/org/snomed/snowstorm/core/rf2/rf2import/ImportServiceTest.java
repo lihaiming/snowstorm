@@ -72,7 +72,7 @@ public class ImportServiceTest extends AbstractTest {
 		final String branchPath = "MAIN";
 		Assert.assertEquals(1, branchService.findAll().size());
 
-		String importId = importService.createJob(RF2Type.FULL, branchPath, true);
+		String importId = importService.createJob(RF2Type.FULL, branchPath, true, false);
 		importService.importArchive(importId, new FileInputStream(rf2Archive));
 
 		final List<Branch> branches = branchService.findAll();
@@ -242,7 +242,7 @@ public class ImportServiceTest extends AbstractTest {
 		assertNotNull(codeSystemService.find(CodeSystemService.SNOMEDCT));
 		assertTrue(codeSystemService.findAllVersions(CodeSystemService.SNOMEDCT).isEmpty());
 
-		String importId = importService.createJob(RF2Type.SNAPSHOT, branchPath, true);
+		String importId = importService.createJob(RF2Type.SNAPSHOT, branchPath, true, false);
 		importService.importArchive(importId, new FileInputStream(rf2Archive));
 
 
@@ -317,7 +317,7 @@ public class ImportServiceTest extends AbstractTest {
 		assertEquals("MAIN", codeSystemVersion.getParentBranchPath());
 
 		// Import delta (test archive has a delta at a later date than the snapshot which is not normal but convenient for this test)
-		String importDeltaId = importService.createJob(RF2Type.DELTA, branchPath, true);
+		String importDeltaId = importService.createJob(RF2Type.DELTA, branchPath, true, false);
 		importService.importArchive(importDeltaId, new FileInputStream(rf2Archive));
 
 		Branch mainBranch = branchService.findLatest("MAIN");
@@ -339,7 +339,7 @@ public class ImportServiceTest extends AbstractTest {
 
 
 		// Import Snapshot using Stated Relationships
-		String importId = importService.createJob(RF2Type.SNAPSHOT, branchPath, true);
+		String importId = importService.createJob(RF2Type.SNAPSHOT, branchPath, true, false);
 		importService.importArchive(importId, new FileInputStream(rf2Archive));
 
 		final Concept conceptBleeding = conceptService.find("131148009", branchPath);
@@ -349,7 +349,7 @@ public class ImportServiceTest extends AbstractTest {
 
 
 		// Import Delta making all Stated Relationships inactive and replacing with OWL Axioms
-		String importDeltaId = importService.createJob(RF2Type.DELTA, branchPath, false);
+		String importDeltaId = importService.createJob(RF2Type.DELTA, branchPath, false, false);
 		importService.importArchive(importDeltaId, new FileInputStream(completeOwlRf2Archive));
 
 		assertEquals("All stated relationships now inactive.", 0, getActiveStatedRelationshipCount(branchPath));
@@ -403,7 +403,7 @@ public class ImportServiceTest extends AbstractTest {
 		// The content in these zips is not correct or meaningful. We are just using rows to test how the import function behaves with effectiveTimes.
 
 		File zipFile = ZipUtil.zipDirectoryRemovingCommentsAndBlankLines("src/test/resources/import-tests/blankOrLaterEffectiveTimeBase");
-		String importId = importService.createJob(RF2Type.SNAPSHOT, "MAIN", true);
+		String importId = importService.createJob(RF2Type.SNAPSHOT, "MAIN", true, false);
 		importService.importArchive(importId, new FileInputStream(zipFile));
 
 		List<Concept> concepts = conceptService.findAll("MAIN", PageRequest.of(0, 10)).getContent();
@@ -426,8 +426,17 @@ public class ImportServiceTest extends AbstractTest {
 		assertEquals(4, relationshipGroups.get(0).get());
 		assertNull(relationshipGroups.get(1));
 
+		// Assert contents of release fields
+		Concept concept = conceptService.find("400000000", "MAIN");
+		assertTrue(concept.isReleased());
+		assertEquals("true|900000000000012004|900000000000074008", concept.getReleaseHash());
+		Description description = concept.getDescription("400000010");
+		assertTrue(description.isReleased());
+		assertEquals("true|Associated morphology|900000000000012004|en|900000000000013009|900000000000020002", description.getReleaseHash());
+
+
 		zipFile = ZipUtil.zipDirectoryRemovingCommentsAndBlankLines("src/test/resources/import-tests/blankOrLaterEffectiveTimeTest");
-		importId = importService.createJob(RF2Type.DELTA, "MAIN", true);
+		importId = importService.createJob(RF2Type.DELTA, "MAIN", false, false);
 		importService.importArchive(importId, new FileInputStream(zipFile));
 
 		concepts = conceptService.findAll("MAIN", PageRequest.of(0, 10)).getContent();
@@ -446,6 +455,14 @@ public class ImportServiceTest extends AbstractTest {
 
 		assertEquals(2, relationshipGroups.get(0).get());
 		assertEquals(2, relationshipGroups.get(1).get());
+
+		// Assert contents of release fields is unchanged after RF2 import of unreleased content
+		concept = conceptService.find("400000000", "MAIN");
+		assertTrue(concept.isReleased());
+		assertEquals("true|900000000000012004|900000000000074008", concept.getReleaseHash());
+		description = concept.getDescription("400000010");
+		assertTrue(description.isReleased());
+		assertEquals("true|Associated morphology|900000000000012004|en|900000000000013009|900000000000020002", description.getReleaseHash());
 
 
 		// Import again allowing version 20180131 to be patched
@@ -469,11 +486,70 @@ public class ImportServiceTest extends AbstractTest {
 
 		assertEquals(1, relationshipGroups.get(0).get());
 		assertEquals(3, relationshipGroups.get(1).get());
+	}
+
+
+	@Test
+	public void testImportWithEffectiveTimeCleared() throws IOException, ReleaseImportException {
+		// The content in these zips is for the daily build and the effective time needs to be cleared
+		File zipFile = ZipUtil.zipDirectoryRemovingCommentsAndBlankLines("src/test/resources/dummy-daily-build/DailyBuild_Day1");
+		String importId = importService.createJob(RF2Type.DELTA, "MAIN", false, true);
+		importService.importArchive(importId, new FileInputStream(zipFile));
+
+		List<Concept> concepts = conceptService.findAll("MAIN", PageRequest.of(0, 10)).getContent();
+		assertEquals(2, concepts.size());
+		Concept concept = conceptService.find("131148009", "MAIN");
+		assertNull(concept.getEffectiveTime());
+		assertFalse(concept.isReleased());
+		assertNull(concept.getReleasedEffectiveTime());
+
+	}
+
+	@Test
+	public void testImportWithBlankEffectiveTime() throws IOException, ReleaseImportException {
+
+		File zipFile = ZipUtil.zipDirectoryRemovingCommentsAndBlankLines("src/test/resources/import-tests/blankEffectiveTimeTest");
+		String importId = importService.createJob(RF2Type.DELTA, "MAIN", false, false);
+		importService.importArchive(importId, new FileInputStream(zipFile));
+
+		List<Concept> concepts = conceptService.findAll("MAIN", PageRequest.of(0, 10)).getContent();
+		assertEquals(5, concepts.size());
+		Concept concept = conceptService.find("100000000", "MAIN");
+		assertNull(concept.getEffectiveTime());
+		assertFalse(concept.isReleased());
+		assertNull(concept.getReleasedEffectiveTime());
+		assertNull(concept.getReleaseHash());
+		assertNull(concept.getEffectiveTimeI());
+
+		Set<Description> descriptions = concept.getDescriptions();
+		assertNotNull(descriptions);
+		assertEquals(1, descriptions.size());
+		Description description = descriptions.iterator().next();
+		assertNull(description.getEffectiveTime());
+		assertNull(description.getEffectiveTimeI());
+		assertNull(description.getReleaseHash());
+		assertFalse(description.isReleased());
+		assertNull(description.getReleasedEffectiveTime());
+
+		Relationship relationship = relationshipService.findRelationship("MAIN", "200000020");
+		assertNotNull(relationship);
+		assertFalse(relationship.isReleased());
+		assertNull(relationship.getEffectiveTimeI());
+		assertNull(relationship.getEffectiveTime());
+		assertNull(relationship.getReleaseHash());
+
+		ReferenceSetMember referenceSetMember = referenceSetMemberService.findMember("MAIN", "009c6780-97ff-5298-8c6d-37df7b41838e");
+		assertNotNull(referenceSetMember);
+		assertFalse(referenceSetMember.isReleased());
+		assertNull(referenceSetMember.getReleaseHash());
+		assertNull(referenceSetMember.getEffectiveTimeI());
+		assertNull(referenceSetMember.getReleasedEffectiveTime());
+		assertNull(referenceSetMember.getEffectiveTime());
 
 
 	}
 
-	private void collectContentCounts(List<Concept> concepts, Map<String, AtomicInteger> conceptDefinitionStatuses, Map<String, AtomicInteger> descriptionCaseSignificance, Map<String, AtomicInteger> descriptionAcceptability, Map<Integer, AtomicInteger> relationshipGroups) {
+		private void collectContentCounts(List<Concept> concepts, Map<String, AtomicInteger> conceptDefinitionStatuses, Map<String, AtomicInteger> descriptionCaseSignificance, Map<String, AtomicInteger> descriptionAcceptability, Map<Integer, AtomicInteger> relationshipGroups) {
 		conceptDefinitionStatuses.clear();
 		descriptionCaseSignificance.clear();
 		descriptionAcceptability.clear();

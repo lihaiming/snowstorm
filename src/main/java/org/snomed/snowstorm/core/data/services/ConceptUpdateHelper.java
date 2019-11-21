@@ -10,9 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.snomed.snowstorm.config.SearchLanguagesConfiguration;
 import org.snomed.snowstorm.core.data.domain.*;
-import org.snomed.snowstorm.core.data.repositories.ConceptRepository;
-import org.snomed.snowstorm.core.data.repositories.DescriptionRepository;
-import org.snomed.snowstorm.core.data.repositories.RelationshipRepository;
+import org.snomed.snowstorm.core.data.repositories.*;
 import org.snomed.snowstorm.core.data.services.identifier.IdentifierReservedBlock;
 import org.snomed.snowstorm.core.data.services.identifier.IdentifierService;
 import org.snomed.snowstorm.core.data.services.pojo.PersistedComponents;
@@ -48,6 +46,12 @@ public class ConceptUpdateHelper extends ComponentService {
 
 	@Autowired
 	private ReferenceSetMemberService memberService;
+
+	@Autowired
+	private ReferenceSetTypeRepository referenceSetTypeRepository;
+
+	@Autowired
+	private QueryConceptRepository queryConceptRepository;
 
 	@Autowired
 	private AxiomConversionService axiomConversionService;
@@ -97,10 +101,14 @@ public class ConceptUpdateHelper extends ComponentService {
 				concept.setInactivationIndicator(null);
 				concept.setAssociationTargets(null);
 			} else {
-				// Make relationships and axioms inactive
-				concept.getRelationships().forEach(relationship -> relationship.setActive(false));
-				concept.getDescriptions().forEach(description -> description.setInactivationIndicator(inactivationIndicatorNames.get(Concepts.CONCEPT_NON_CURRENT)));
+				// Make stated relationships and axioms inactive
+				concept.getRelationships().forEach(relationship -> {
+					if (Concepts.STATED_RELATIONSHIP.equals(relationship.getCharacteristicTypeId())) {
+						relationship.setActive(false);
+					}
+				});
 				newVersionOwlAxiomMembers.forEach(axiom -> axiom.setActive(false));
+				concept.getDescriptions().forEach(description -> description.setInactivationIndicator(inactivationIndicatorNames.get(Concepts.CONCEPT_NON_CURRENT)));
 			}
 
 			// Mark changed concepts as changed
@@ -255,20 +263,24 @@ public class ConceptUpdateHelper extends ComponentService {
 		if (existingAssociations != null && !MapUtil.containsAllKeysAndSetsAreSupersets(newAssociations, existingAssociations)) {
 			// One or more existing associations need to be made inactive
 
-			Set<ReferenceSetMember> existingAssociationTargetMembers = existingComponent.getAssociationTargetMembers();
 			if (newAssociations == null) {
 				newAssociations = new HashMap<>();
 			}
+			// Check each association type
 			for (String associationName : existingAssociations.keySet()) {
+				// Associations for this type on both sides
 				Set<String> existingAssociationsOfType = existingAssociations.get(associationName);
 				Set<String> newAssociationsOfType = newAssociations.get(associationName);
-				for (String existingAssociationOfType : existingAssociationsOfType) {
-					if (newAssociationsOfType == null || !newAssociationsOfType.contains(existingAssociationOfType)) {
+				// Iterate existing set
+				for (String existingAssociationTarget : existingAssociationsOfType) {
+					// If new set doesn't exist or doesn't contain existing association make it inactive.
+					if (newAssociationsOfType == null || !newAssociationsOfType.contains(existingAssociationTarget)) {
 						// Existing association should be made inactive
+						// Find the refset member for this association concept id and target concept id
 						String associationRefsetId = Concepts.historicalAssociationNames.inverse().get(associationName);
-						for (ReferenceSetMember existingMember : existingAssociationTargetMembers) {
+						for (ReferenceSetMember existingMember : Optional.ofNullable(existingComponent.getAssociationTargetMembers()).orElse(Collections.emptySet())) {
 							if (existingMember.isActive() && existingMember.getRefsetId().equals(associationRefsetId)
-									&& existingAssociationOfType.equals(existingMember.getAdditionalField("targetComponentId"))) {
+									&& existingAssociationTarget.equals(existingMember.getAdditionalField(ReferenceSetMember.AssociationFields.TARGET_COMP_ID))) {
 								existingMember.setActive(false);
 								existingMember.markChanged();
 								refsetMembersToPersist.add(existingMember);
@@ -306,25 +318,46 @@ public class ConceptUpdateHelper extends ComponentService {
 			String indicatorReferenceSet) {
 
 		String newIndicator = newComponent.getInactivationIndicator();
-		String existingIndicator = existingComponent == null ? null : existingComponent.getInactivationIndicator();
-		if (existingIndicator != null && !existingIndicator.equals(newIndicator)) {
-			// Make existing indicator inactive
-			ReferenceSetMember existingIndicatorMember = existingComponent.getInactivationIndicatorMember();
-			existingIndicatorMember.setActive(false);
-			existingIndicatorMember.markChanged();
-			refsetMembersToPersist.add(existingIndicatorMember);
-		}
-		if (newIndicator != null && !newIndicator.equals(existingIndicator)) {
-			// Create new indicator
-			String newIndicatorId = inactivationIndicatorNames.inverse().get(newIndicator);
+		String newIndicatorId = null;
+		if (newIndicator != null) {
+			newIndicatorId = inactivationIndicatorNames.inverse().get(newIndicator);
 			if (newIndicatorId == null) {
 				throw new IllegalArgumentException(newComponent.getClass().getSimpleName() + " inactivation indicator not recognised '" + newIndicator + "'.");
 			}
+		}
+
+		ReferenceSetMember newMember = newComponent.getInactivationIndicatorMember();
+		ReferenceSetMember matchingExistingMember = null;
+		if (existingComponent != null) {
+			for (ReferenceSetMember existingIndicatorMember : existingComponent.getInactivationIndicatorMembers()) {
+				if (matchingExistingMember == null && existingIndicatorMember.getAdditionalField("valueId").equals(newIndicatorId) &&
+						(newMember == null || existingIndicatorMember.getId().equals(newMember.getId()))) {
+					// Keep member
+					if (!existingIndicatorMember.isActive()) {
+						existingIndicatorMember.setActive(true);
+						existingIndicatorMember.markChanged();
+						refsetMembersToPersist.add(existingIndicatorMember);
+					}
+					matchingExistingMember = existingIndicatorMember;
+				} else {
+					// Remove member
+					if (existingIndicatorMember.isActive()) {
+						existingIndicatorMember.setActive(false);
+						existingIndicatorMember.markChanged();
+						refsetMembersToPersist.add(existingIndicatorMember);
+					}
+				}
+			}
+		}
+
+		if (newIndicatorId != null && matchingExistingMember == null) {
+			// Create new indicator
 			ReferenceSetMember newIndicatorMember = new ReferenceSetMember(newComponent.getModuleId(), indicatorReferenceSet, newComponent.getId());
 			newIndicatorMember.setAdditionalField("valueId", newIndicatorId);
 			newIndicatorMember.setChanged(true);
 			refsetMembersToPersist.add(newIndicatorMember);
-			newComponent.setInactivationIndicatorMember(newIndicatorMember);
+			newComponent.getInactivationIndicatorMembers().clear();
+			newComponent.addInactivationIndicatorMember(newIndicatorMember);
 		}
 	}
 
@@ -332,7 +365,7 @@ public class ConceptUpdateHelper extends ComponentService {
 		// Mark concept and components as deleted
 		logger.info("Deleting concept {} on branch {} at timepoint {}", concept.getConceptId(), path, commit.getTimepoint());
 		concept.markDeleted();
-		Set<ReferenceSetMember> membersToDelete = new HashSet<>();
+		Set<ReferenceSetMember> membersToDelete = new HashSet<>(concept.getAllOwlAxiomMembers());
 		concept.getDescriptions().forEach(description -> {
 			description.markDeleted();
 			membersToDelete.addAll(description.getLangRefsetMembers().values());
@@ -357,7 +390,6 @@ public class ConceptUpdateHelper extends ComponentService {
 		membersToDelete.forEach(ReferenceSetMember::markDeleted);
 		memberService.doSaveBatchMembers(membersToDelete, commit);
 		doSaveBatchRelationships(concept.getRelationships(), commit);
-		commit.markSuccessful();
 	}
 
 
@@ -387,7 +419,15 @@ public class ConceptUpdateHelper extends ComponentService {
 		doSaveBatchComponents(relationships, commit, "relationshipId", relationshipRepository);
 	}
 
-	private void doDeleteMembersWhereReferencedComponentDeleted(Set<String> entityVersionsDeleted, Commit commit) {
+	private void doSaveBatchReferenceSetType(Collection<ReferenceSetType> referenceSetTypes, Commit commit) {
+		doSaveBatchComponents(referenceSetTypes, commit, ReferenceSetType.Fields.CONCEPT_ID, referenceSetTypeRepository);
+	}
+
+	private void doSaveBatchQueryConcept(Collection<QueryConcept> queryConcepts, Commit commit) {
+		doSaveBatchComponents(queryConcepts, commit, QueryConcept.Fields.CONCEPT_ID_FORM, queryConceptRepository);
+	}
+
+	void doDeleteMembersWhereReferencedComponentDeleted(Set<String> entityVersionsDeleted, Commit commit) {
 		NativeSearchQuery query = new NativeSearchQueryBuilder()
 				.withQuery(
 						boolQuery()
@@ -409,13 +449,6 @@ public class ConceptUpdateHelper extends ComponentService {
 	}
 
 	private <C extends SnomedComponent> void markDeletionsAndUpdates(Set<C> newComponents, Set<C> existingComponents, boolean rebase) {
-		// Mark deletions
-		for (C existingComponent : existingComponents) {
-			if (!newComponents.contains(existingComponent)) {
-				existingComponent.markDeleted();
-				newComponents.add(existingComponent);// Add to newComponents collection so the deletion is persisted
-			}
-		}
 		// Mark updates
 		final Map<String, C> map = existingComponents.stream().collect(Collectors.toMap(DomainEntity::getId, Function.identity()));
 		for (C newComponent : newComponents) {
@@ -430,19 +463,37 @@ public class ConceptUpdateHelper extends ComponentService {
 				newComponent.clearReleaseDetails();
 			}
 		}
+		// Mark deletions
+		for (C existingComponent : existingComponents) {
+			if (!newComponents.contains(existingComponent)) {
+				if (existingComponent.isReleased()) {
+					existingComponent.setActive(false);
+					existingComponent.setChanged(true);
+					existingComponent.updateEffectiveTime();
+				} else {
+					existingComponent.markDeleted();
+				}
+				newComponents.add(existingComponent);// Add to newComponents collection so the deletion is persisted
+			}
+		}
 	}
 
-	<T extends SnomedComponent> void doSaveBatchComponents(Collection<T> components, Class<T> type, Commit commit) {
+	@SuppressWarnings("unchecked")
+	<T extends DomainEntity> void doSaveBatchComponents(Collection<T> components, Class<T> type, Commit commit) {
 		if (type.equals(Concept.class)) {
 			doSaveBatchConcepts((Collection<Concept>) components, commit);
 		} else if (type.equals(Description.class)) {
 			doSaveBatchDescriptions((Collection<Description>) components, commit);
 		} else if (type.equals(Relationship.class)) {
 			doSaveBatchRelationships((Collection<Relationship>) components, commit);
-		} else if (ReferenceSetMember.class.isAssignableFrom(type)) {
+		} else if (type.equals(ReferenceSetMember.class)) {
 			memberService.doSaveBatchMembers((Collection<ReferenceSetMember>) components, commit);
+		} else if (type.equals(ReferenceSetType.class)) {
+			doSaveBatchReferenceSetType((Collection<ReferenceSetType>) components, commit);
+		} else if (type.equals(QueryConcept.class)) {
+			doSaveBatchQueryConcept((Collection<QueryConcept>) components, commit);
 		} else {
-			throw new IllegalArgumentException("SnomedComponent type " + type + " not regognised");
+			throw new IllegalArgumentException("DomainEntity type " + type + " not recognised");
 		}
 	}
 

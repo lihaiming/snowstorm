@@ -20,10 +20,7 @@ import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.query.NativeSearchQuery;
 import org.springframework.data.elasticsearch.core.query.NativeSearchQueryBuilder;
 
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static org.elasticsearch.index.query.QueryBuilders.*;
@@ -37,8 +34,8 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 	private final DescriptionService descriptionService;
 	private final QueryService queryService;
 	private final TestResourceProvider testResourceProvider;
-
 	private static Set<String> hierarchyRootIds;
+	private Map<String, String> statedHierarchyRootIdCache = Collections.synchronizedMap(new HashMap<>());
 	private static final Logger LOGGER = LoggerFactory.getLogger(DescriptionDroolsValidationService.class);
 
 	DescriptionDroolsValidationService(String branchPath,
@@ -60,7 +57,7 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 	@Override
 	public Set<String> getFSNs(Set<String> conceptIds, String... languageRefsetIds) {
 		return descriptionService.findDescriptions(branchPath, conceptIds).stream()
-				.filter(d -> d.getTypeId().equals(Concepts.FSN))
+				.filter(d -> d.isActive() && d.getTypeId().equals(Concepts.FSN))
 				.map(org.snomed.snowstorm.core.data.domain.Description::getTerm)
 				.collect(Collectors.toSet());
 	}
@@ -80,7 +77,7 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 				.withQuery(boolQuery()
 						.must(branchCriteria.getEntityBranchCriteria(Description.class))
 						.must(termQuery("active", active))
-						.must(matchPhraseQuery("term", exactTerm))
+						.must(termQuery("term", exactTerm))
 				)
 				.build();
 		List<Description> matches = elasticsearchTemplate.queryForList(query, Description.class);
@@ -91,22 +88,24 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 
 	@Override
 	public Set<org.ihtsdo.drools.domain.Description> findMatchingDescriptionInHierarchy(org.ihtsdo.drools.domain.Concept concept, org.ihtsdo.drools.domain.Description description) {
-		Set<org.ihtsdo.drools.domain.Description> matchingDescriptions = findActiveDescriptionByExactTerm(description.getTerm())
-				.stream().filter(d -> d.getLanguageCode().equals(description.getLanguageCode())).collect(Collectors.toSet());
+		try {
+			Set<org.ihtsdo.drools.domain.Description> matchingDescriptions = findActiveDescriptionByExactTerm(description.getTerm())
+					.stream().filter(d -> d.getLanguageCode().equals(description.getLanguageCode())).collect(Collectors.toSet());
 
-		if (!matchingDescriptions.isEmpty()) {
-			// Filter matching descriptions by hierarchy
+			if (!matchingDescriptions.isEmpty()) {
+				// Filter matching descriptions by hierarchy
 
-			// Find root for this concept
-			String conceptHierarchyRootId = findStatedHierarchyRootId(concept);
-			if (conceptHierarchyRootId != null) {
-				LOGGER.info("Found stated hierarchy id {}", conceptHierarchyRootId);
-
-				return matchingDescriptions.stream().filter(d -> {
-					Set<Long> matchingDescriptionAncestors = queryService.findAncestorIds(d.getConceptId(), branchPath, true);
-					return matchingDescriptionAncestors.contains(new Long(conceptHierarchyRootId));
-				}).collect(Collectors.toSet());
+				// Find root for this concept
+				String conceptHierarchyRootId = findStatedHierarchyRootId(concept);
+				if (conceptHierarchyRootId != null) {
+					return matchingDescriptions.stream().filter(d -> {
+						Set<Long> matchingDescriptionAncestors = queryService.findAncestorIds(branchCriteria, branchPath, true, d.getConceptId());
+						return matchingDescriptionAncestors.contains(new Long(conceptHierarchyRootId));
+					}).collect(Collectors.toSet());
+				}
 			}
+		} catch (IllegalArgumentException e) {
+			LOGGER.error("Drools rule failed.", e);
 		}
 		return Collections.emptySet();
 	}
@@ -159,9 +158,17 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 	}
 
 	private String findStatedHierarchyRootId(org.ihtsdo.drools.domain.Concept concept) {
-		Set<? extends org.ihtsdo.drools.domain.Relationship> statedIsARelationships = concept.getRelationships().stream().filter(r -> r.isActive()
+		String conceptId = concept.getId();
+		if (!statedHierarchyRootIdCache.containsKey(conceptId)) {
+			statedHierarchyRootIdCache.put(conceptId, doFindStatedHierarchyRootId(concept));
+		}
+		return statedHierarchyRootIdCache.get(conceptId);
+	}
+
+	private String doFindStatedHierarchyRootId(org.ihtsdo.drools.domain.Concept concept) {
+		Set<String> statedIsARelationships = concept.getRelationships().stream().filter(r -> r.isActive()
 				&& Concepts.STATED_RELATIONSHIP.equals(r.getCharacteristicTypeId())
-				&& Concepts.ISA.equals(r.getTypeId())).collect(Collectors.toSet());
+				&& Concepts.ISA.equals(r.getTypeId())).map(org.ihtsdo.drools.domain.Relationship :: getDestinationId).collect(Collectors.toSet());
 
 		if (statedIsARelationships.isEmpty()) {
 			return null;
@@ -174,9 +181,10 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 		}
 
 		// Search ancestors of stated is-a relationships
-		String firstStatedParentId = statedIsARelationships.iterator().next().getDestinationId();
+		String firstStatedParentId = statedIsARelationships.iterator().next();
 		Set<Long> statedAncestors = queryService.findAncestorIds(firstStatedParentId, branchPath, true);
-		statedHierarchyRoot = Sets.intersection(hierarchyRootIds, statedAncestors);
+		Set<String> statedAncestorsAsStringArray = statedAncestors.stream().map(String::valueOf).collect(Collectors.toSet());
+		statedHierarchyRoot = Sets.intersection(hierarchyRootIds, statedAncestorsAsStringArray);
 		if (!statedHierarchyRoot.isEmpty()) {
 			return statedHierarchyRoot.iterator().next();
 		}
@@ -187,7 +195,7 @@ public class DescriptionDroolsValidationService implements org.ihtsdo.drools.ser
 	private Set<String> findHierarchyRootsOnMAIN() {
 		if (hierarchyRootIds == null) {
 			synchronized (DescriptionDroolsValidationService.class) {
-				QueryBuilder mainBranchCriteria = versionControlHelper.getBranchCriteria("MAIN").getEntityBranchCriteria(org.snomed.snowstorm.core.data.domain.Description.class);
+				QueryBuilder mainBranchCriteria = versionControlHelper.getBranchCriteria("MAIN").getEntityBranchCriteria(Relationship.class);
 				NativeSearchQuery query = new NativeSearchQueryBuilder()
 						.withQuery(boolQuery()
 								.must(mainBranchCriteria)

@@ -1,5 +1,6 @@
 package org.snomed.snowstorm.core.data.services.transitiveclosure;
 
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,56 +20,53 @@ public class Node {
 		parents = new HashSet<>();
 	}
 
-	public Set<Long> getTransitiveClosure(String path) {
-		Set<Long> parentIds = new HashSet<>();
-		return getTransitiveClosure(parentIds, 1, path);
-	}
-
-	private Set<Long> getTransitiveClosure(Set<Long> parentIds, final int depth, String path) {
-		if (depth > 50) {
-			String message = "Transitive closure stack depth has exceeded the soft limit for concept " + id + " on path " + path + ", ancestor ids: " + parentIds.toString();
-			LOGGER.error(message);
-			return parentIds;
+	public Set<Long> getTransitiveClosure(String path, boolean throwExceptionIfLoopFound) throws GraphBuilderException {
+		LongOpenHashSet parentIds = new LongOpenHashSet();
+		getTransitiveClosure(parentIds);
+		if (parentIds.contains(id)) {
+			String message = String.format("Loop found in transitive closure for concept %s on branch %s.", id, path);
+			if (throwExceptionIfLoopFound) {
+				throw new GraphBuilderException(message);
+			} else {
+				LOGGER.warn(message);
+			}
+			parentIds.remove(id);
 		}
-		parents.forEach(node -> {
-			parentIds.add(node.getId());
-			node.getTransitiveClosure(parentIds, depth + 1, path);
-		});
 		return parentIds;
 	}
 
-	public Long getId() {
-		return id;
+	private void getTransitiveClosure(Set<Long> parentIds) {
+		for (Node parent : parents) {
+			if (parentIds.add(parent.getId())) {
+				parent.getTransitiveClosure(parentIds);
+			}
+		}
+	}
+
+	public boolean isAncestorOrSelfUpdated() {
+		return isAncestorOrSelfUpdated(new LongOpenHashSet());
+	}
+
+	private boolean isAncestorOrSelfUpdated(Set<Long> parentIds) {
+		if (updated) {
+			return true;
+		}
+		for (Node parent : parents) {
+			if (parentIds.add(parent.getId())) {
+				if (parent.isAncestorOrSelfUpdated(parentIds)) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	void addParent(Node parent) {
 		parents.add(parent);
 	}
 
-	void removeParent(Long parentId) {
-		parents.remove(new Node(parentId));
-	}
-
-	public boolean isAncestorOrSelfUpdated(String path) {
-		return isAncestorOrSelfUpdated(this, 1, path);
-	}
-
-	private boolean isAncestorOrSelfUpdated(Node node, int depth, String path) {
-		if (depth > 50) {
-			String message = "Node updated check has exceeded the soft limit for concept " + id + " on path " + path + ", working around.";
-			LOGGER.warn(message);
-			// None found before recursion, returning false allows other paths to be explored.
-			return false;
-		}
-		if (node.updated) {
-			return true;
-		}
-		for (Node parent : node.parents) {
-			if (isAncestorOrSelfUpdated(parent, depth + 1, path)) {
-				return true;
-			}
-		}
-		return false;
+	public Long getId() {
+		return id;
 	}
 
 	public Node markUpdated() {

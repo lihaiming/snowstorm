@@ -39,9 +39,18 @@ public class CodeSystem implements CodeSystemCreate {
 	private String defaultLanguageCode;
 
 	@Field(type = FieldType.keyword)
+	private String[] defaultLanguageReferenceSets;
+
+	@Field(type = FieldType.keyword)
 	@NotNull
 	@Pattern(regexp = "MAIN.*")
 	private String branchPath;
+
+	@Field(type = FieldType.Integer)
+	private Integer dependantVersion;
+
+	@Field(type = FieldType.Boolean)
+	private boolean dailyBuildAvailable;
 
 	@Transient
 	private Map<String, String> languages;
@@ -99,12 +108,36 @@ public class CodeSystem implements CodeSystemCreate {
 		this.defaultLanguageCode = defaultLanguageCode;
 	}
 
+	public String[] getDefaultLanguageReferenceSets() {
+		return defaultLanguageReferenceSets;
+	}
+
+	public void setDefaultLanguageReferenceSets(String[] defaultLanguageReferenceSets) {
+		this.defaultLanguageReferenceSets = defaultLanguageReferenceSets;
+	}
+
 	public String getBranchPath() {
 		return branchPath;
 	}
 
 	public void setBranchPath(String branchPath) {
 		this.branchPath = branchPath;
+	}
+
+	public Integer getDependantVersion() {
+		return dependantVersion;
+	}
+
+	public void setDependantVersion(Integer dependantVersion) {
+		this.dependantVersion = dependantVersion;
+	}
+
+	public boolean isDailyBuildAvailable() {
+		return dailyBuildAvailable;
+	}
+
+	public void setDailyBuildAvailable(boolean dailyBuildAvailable) {
+		this.dailyBuildAvailable = dailyBuildAvailable;
 	}
 
 	public Map<String, String> getLanguages() {

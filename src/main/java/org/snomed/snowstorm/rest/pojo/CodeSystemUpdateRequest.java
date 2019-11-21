@@ -1,11 +1,17 @@
 package org.snomed.snowstorm.rest.pojo;
 
+import io.swagger.annotations.ApiModelProperty;
+
 public class CodeSystemUpdateRequest {
 
 	public String name;
 	public String countryCode;
 	public String defaultLanguageCode;
+	public String[] defaultLanguageReferenceSets;
 	public String branchPath;
+
+	@ApiModelProperty(value = "false")
+	public boolean dailyBuildAvailable;
 
 	public CodeSystemUpdateRequest() {
 	}
@@ -27,7 +33,15 @@ public class CodeSystemUpdateRequest {
 		return defaultLanguageCode;
 	}
 
+	public String[] getDefaultLanguageReferenceSets() {
+		return defaultLanguageReferenceSets;
+	}
+
 	public String getBranchPath() {
 		return branchPath;
+	}
+
+	public boolean isDailyBuildAvailable() {
+		return dailyBuildAvailable;
 	}
 }

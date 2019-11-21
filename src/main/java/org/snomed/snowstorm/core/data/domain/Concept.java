@@ -21,22 +21,23 @@ import java.util.stream.Collectors;
 import static org.snomed.snowstorm.core.util.DescriptionHelper.EN_LANGUAGE_CODE;
 
 @Document(indexName = "concept")
-@JsonPropertyOrder({"conceptId", "fsn", "pt", "active", "effectiveTime", "released", "releasedEffectiveTime",  "inactivationIndicator", "associationTargets",
+@JsonPropertyOrder({"conceptId", "descendantCount", "fsn", "pt", "active", "effectiveTime", "released", "releasedEffectiveTime",  "inactivationIndicator", "associationTargets",
 		"moduleId", "definitionStatus", "definitionStatusId", "descriptions", "classAxioms", "gciAxioms", "relationships"})
 public class Concept extends SnomedComponent<Concept> implements ConceptView, SnomedComponentWithInactivationIndicator, SnomedComponentWithAssociations {
 
 	public interface Fields extends SnomedComponent.Fields {
-
 		String CONCEPT_ID = "conceptId";
 		String MODULE_ID = "moduleId";
 		String DEFINITION_STATUS_ID = "definitionStatusId";
 	}
+
 	@JsonView(value = View.Component.class)
 	@Field(type = FieldType.keyword, store = true)
 	@Size(min = 5, max = 18)
 	private String conceptId;
+
 	@JsonIgnore
-	private ReferenceSetMember inactivationIndicatorMember;
+	private Set<ReferenceSetMember> inactivationIndicatorMembers;
 
 	@JsonIgnore
 	// Populated when requesting an update
@@ -76,6 +77,9 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 	@JsonIgnore
 	private List<String> requestedLanguages;
 
+	@Transient
+	private Long descendantCount;
+
 	public Concept() {
 		active = true;
 		moduleId = Concepts.CORE_MODULE;
@@ -84,6 +88,7 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 		relationships = new HashSet<>();
 		classAxioms = new HashSet<>();
 		generalConceptInclusionAxioms = new HashSet<>();
+		inactivationIndicatorMembers = new HashSet<>();
 	}
 
 	public Concept(String conceptId) {
@@ -142,8 +147,13 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 
 	@JsonView(value = View.Component.class)
 	public String getInactivationIndicator() {
-		if (inactivationIndicatorMember != null && inactivationIndicatorMember.isActive()) {
-			return Concepts.inactivationIndicatorNames.get(inactivationIndicatorMember.getAdditionalField("valueId"));
+		Set<ReferenceSetMember> inactivationIndicatorMembers = getInactivationIndicatorMembers();
+		if (inactivationIndicatorMembers != null) {
+			for (ReferenceSetMember inactivationIndicatorMember : inactivationIndicatorMembers) {
+				if (inactivationIndicatorMember.isActive()) {
+					return Concepts.inactivationIndicatorNames.get(inactivationIndicatorMember.getAdditionalField("valueId"));
+				}
+			}
 		}
 		return inactivationIndicatorName;
 	}
@@ -302,17 +312,25 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 
 	@JsonIgnore
 	public ReferenceSetMember getInactivationIndicatorMember() {
-		return inactivationIndicatorMember;
+		return !inactivationIndicatorMembers.isEmpty() ? inactivationIndicatorMembers.iterator().next() : null;
 	}
 
-	public void setInactivationIndicatorMember(ReferenceSetMember inactivationIndicatorMember) {
-		this.inactivationIndicatorMember = inactivationIndicatorMember;
+	/*
+	 * There should be at most one inactivation indicator apart from part way through a branch merge.
+	 */
+	@JsonIgnore
+	public Set<ReferenceSetMember> getInactivationIndicatorMembers() {
+		return inactivationIndicatorMembers;
+	}
+
+	public void addInactivationIndicatorMember(ReferenceSetMember inactivationIndicatorMember) {
+		inactivationIndicatorMembers.add(inactivationIndicatorMember);
 	}
 
 	public Set<Relationship> getRelationshipsWithDestination(String destinationId) {
 		return relationships.stream().filter(r -> destinationId.equals(r.getDestinationId())).collect(Collectors.toSet());
 	}
-	
+
 	public List<Relationship> getRelationships(Boolean activeFlag, String typeId, String destinationId, String charTypeId) {
 		List<Relationship> matchingDescriptions = relationships.stream()
 							.filter(rel -> (activeFlag == null || activeFlag.equals(rel.isActive())))
@@ -379,6 +397,15 @@ public class Concept extends SnomedComponent<Concept> implements ConceptView, Sn
 
 	public void setGciAxioms(Set<Axiom> generalConceptInclusionAxioms) {
 		this.generalConceptInclusionAxioms = generalConceptInclusionAxioms;
+	}
+
+	@JsonView(value = View.Component.class)
+	public Long getDescendantCount() {
+		return descendantCount;
+	}
+
+	public void setDescendantCount(Long descendantCount) {
+		this.descendantCount = descendantCount;
 	}
 
 	public void setRequestedLanguages(List<String> requestedLanguages) {
